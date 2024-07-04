@@ -30,6 +30,10 @@ use bitcoin::secp256k1::ecdsa::Signature;
 use bitcoin::{secp256k1, Witness};
 use bitcoin::blockdata::script::ScriptBuf;
 use bitcoin::hash_types::Txid;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+// #[cfg(feature = "serde")]
+// use serde_with::serde_as;
 
 use crate::blinded_path::payment::{BlindedPaymentTlvs, ForwardTlvs, ReceiveTlvs};
 use crate::ln::types::{ChannelId, PaymentPreimage, PaymentHash, PaymentSecret};
@@ -788,6 +792,8 @@ pub struct AnnouncementSignatures {
 
 /// An address which can be used to connect to a remote peer.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
+// #[cfg_attr(feature = "serde", serde_as(as = "DisplayFromStr"))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum SocketAddress {
 	/// An IPv4 address and port on which the peer is listening.
 	TcpIpV4 {
