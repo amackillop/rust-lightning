@@ -109,6 +109,7 @@ use bitcoin::secp256k1::{KeyPair, PublicKey, Secp256k1, self};
 use bitcoin::secp256k1::schnorr::Signature;
 use bitcoin::address::{Address, Payload, WitnessProgram, WitnessVersion};
 use bitcoin::key::TweakedPublicKey;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use core::time::Duration;
 use core::hash::{Hash, Hasher};
 use crate::io;

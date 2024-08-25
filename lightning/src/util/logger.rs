@@ -21,6 +21,7 @@ use serde::{Serialize, Deserialize};
 use core::cmp;
 use core::fmt;
 use core::ops::Deref;
+use core::str::FromStr;
 
 use crate::ln::types::ChannelId;
 #[cfg(c_bindings)]
@@ -71,6 +72,22 @@ impl PartialOrd for Level {
 	#[inline]
 	fn ge(&self, other: &Level) -> bool {
 		*self as usize >= *other as usize
+	}
+}
+
+impl FromStr for Level {
+	type Err = &'static str;
+
+	fn from_str(level: &str) -> Result<Level, &'static str> {
+		match level.to_lowercase().as_str() {
+			"gossip" => Ok(Level::Gossip),
+			"trace" => Ok(Level::Trace),
+			"debug" => Ok(Level::Debug),
+			"info" => Ok(Level::Info),
+			"warn" => Ok(Level::Warn),
+			"error" => Ok(Level::Error),
+			_ => Err("Unsupported log level"),
+		}
 	}
 }
 

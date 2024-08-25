@@ -25,7 +25,7 @@ use bitcoin::hashes::{
 	sha256::Hash as Sha256,
 };
 #[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error as DeserializeError};
 use core::fmt;
 use core::ops::Deref;
 
@@ -125,6 +125,23 @@ impl fmt::Display for ChannelId {
 		crate::util::logger::DebugBytes(&self.0).fmt(f)
 	}
 }
+
+// #[cfg(feature = "serde")]
+// impl Serialize for ChannelId {
+// 	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: Serializer {
+// 		serializer.serialize_str(self.to_string().as_str())
+// 	}
+// }
+// #[cfg(feature = "serde")]
+// impl<'de> Deserialize<'de> for ChannelId {
+// 	fn deserialize<D>(deserializer: D) -> Result<ChannelId, D::Error> where D: Deserializer<'de> {
+// 		let channel_id = String::deserialize(deserializer)?
+// 			.parse::<ChannelId>()
+// 			.map_err(|e| D::Error::custom(format_args!("{:?}", e)))?;
+
+// 		Ok(channel_id)
+// 	}
+// }
 
 
 /// The payment hash is the hash of the [`PaymentPreimage`] which is the value used to lock funds
