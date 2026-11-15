@@ -595,7 +595,7 @@ where
 			nodes.range(..)
 		};
 		for (_, ref node) in iter {
-			if let Some(node_info) = node.announcement_info.as_ref() {
+			if let Some(node_info) = node.announcement_info.as_deref() {
 				if let NodeAnnouncementInfo::Relayed(announcement) = node_info {
 					return Some(announcement.clone());
 				}
@@ -1544,7 +1544,7 @@ pub struct NodeInfo {
 	/// More information about a node from node_announcement.
 	/// Optional because we store a Node entry after learning about it from
 	/// a channel announcement, but before receiving a node announcement.
-	pub announcement_info: Option<NodeAnnouncementInfo>,
+	pub announcement_info: Option<Box<NodeAnnouncementInfo>>,
 	/// In memory, each node is assigned a unique ID. They are eagerly reused, ensuring they remain
 	/// relatively dense.
 	///
@@ -1629,7 +1629,7 @@ impl Readable for NodeInfo {
 			announcement_info_wrap;
 
 		Ok(NodeInfo {
-			announcement_info: announcement_info_wrap.map(|w| w.0),
+			announcement_info: announcement_info_wrap.map(|w| Box::new(w.0)),
 			channels,
 			node_counter: u32::max_value(),
 		})
@@ -1959,17 +1959,17 @@ where
 						<= MAX_EXCESS_BYTES_FOR_RELAY;
 
 				node.announcement_info =
-					if let (Some(signed_announcement), true) = (full_msg, should_relay) {
-						Some(NodeAnnouncementInfo::Relayed(signed_announcement.clone()))
+					Some(Box::new(if let (Some(signed_announcement), true) = (full_msg, should_relay) {
+						NodeAnnouncementInfo::Relayed(signed_announcement.clone())
 					} else {
-						Some(NodeAnnouncementInfo::Local(NodeAnnouncementDetails {
+						NodeAnnouncementInfo::Local(NodeAnnouncementDetails {
 							features: msg.features.clone(),
 							last_update: msg.timestamp,
 							rgb: msg.rgb,
 							alias: msg.alias,
 							addresses: msg.addresses.clone(),
-						}))
-					};
+						})
+					}));
 
 				Ok(())
 			},
@@ -4357,7 +4357,7 @@ pub(crate) mod tests {
 		// 2. Check we can read a NodeInfo anyways, but set the NodeAnnouncementInfo to None if invalid
 		let valid_node_info = NodeInfo {
 			channels: Vec::new(),
-			announcement_info: Some(valid_node_ann_info),
+			announcement_info: Some(Box::new(valid_node_ann_info)),
 			node_counter: 0,
 		};
 
