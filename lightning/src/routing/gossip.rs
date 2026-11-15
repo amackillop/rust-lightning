@@ -572,14 +572,14 @@ impl<G: Deref<Target = NetworkGraph<L>>, U: UtxoLookup, L: Logger> RoutingMessag
 		let mut channels = self.network_graph.channels.write().unwrap();
 		for (_, ref chan) in channels.range(starting_point..) {
 			if chan.announcement_message.is_some() {
-				let chan_announcement = chan.announcement_message.clone().unwrap();
+				let chan_announcement = chan.announcement_message.as_deref().cloned().unwrap();
 				let mut one_to_two_announcement: Option<msgs::ChannelUpdate> = None;
 				let mut two_to_one_announcement: Option<msgs::ChannelUpdate> = None;
 				if let Some(one_to_two) = chan.one_to_two.as_ref() {
-					one_to_two_announcement.clone_from(&one_to_two.last_update_message);
+					one_to_two_announcement = one_to_two.last_update_message.as_deref().cloned();
 				}
 				if let Some(two_to_one) = chan.two_to_one.as_ref() {
-					two_to_one_announcement.clone_from(&two_to_one.last_update_message);
+					two_to_one_announcement = two_to_one.last_update_message.as_deref().cloned();
 				}
 				return Some((chan_announcement, one_to_two_announcement, two_to_one_announcement));
 			} else {
@@ -921,7 +921,7 @@ pub struct ChannelUpdateInfo {
 	/// Mostly redundant with the data we store in fields explicitly.
 	/// Everything else is useful only for sending out for initial routing sync.
 	/// Not stored if contains excess data to prevent DoS.
-	pub last_update_message: Option<ChannelUpdate>,
+	pub last_update_message: Option<Box<ChannelUpdate>>,
 }
 
 impl fmt::Display for ChannelUpdateInfo {
@@ -984,7 +984,11 @@ impl Readable for ChannelUpdateInfo {
 				htlc_minimum_msat: _init_tlv_based_struct_field!(htlc_minimum_msat, required),
 				htlc_maximum_msat,
 				fees: _init_tlv_based_struct_field!(fees, required),
-				last_update_message: _init_tlv_based_struct_field!(last_update_message, required),
+				last_update_message: {
+					let message: Option<ChannelUpdate> =
+						_init_tlv_based_struct_field!(last_update_message, required);
+					message.map(Box::new)
+				},
 			})
 		} else {
 			Err(DecodeError::InvalidValue)
@@ -1036,7 +1040,7 @@ pub struct ChannelInfo {
 	/// Mostly redundant with the data we store in fields explicitly.
 	/// Everything else is useful only for sending out for initial routing sync.
 	/// Not stored if contains excess data to prevent DoS.
-	pub announcement_message: Option<ChannelAnnouncement>,
+	pub announcement_message: Option<Box<ChannelAnnouncement>>,
 	/// The timestamp when we received the announcement, if we are running with feature = "std"
 	/// (which we can probably assume we are - non-`std` environments probably won't have a full
 	/// network graph in memory!).
@@ -1183,7 +1187,11 @@ impl Readable for ChannelInfo {
 			node_two: _init_tlv_based_struct_field!(node_two, required),
 			two_to_one: two_to_one_wrap.map(|w| w.0).unwrap_or(None),
 			capacity_sats: _init_tlv_based_struct_field!(capacity_sats, required),
-			announcement_message: _init_tlv_based_struct_field!(announcement_message, required),
+			announcement_message: {
+				let message: Option<ChannelAnnouncement> =
+					_init_tlv_based_struct_field!(announcement_message, required);
+				message.map(Box::new)
+			},
 			announcement_received_time: _init_tlv_based_struct_field!(
 				announcement_received_time,
 				(default_value, 0)
@@ -2222,7 +2230,7 @@ impl<L: Logger> NetworkGraph<L> {
 			two_to_one: None,
 			capacity_sats: utxo_value.map(|a| a.to_sat()),
 			announcement_message: if msg.excess_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY {
-				full_msg.cloned()
+				full_msg.cloned().map(Box::new)
 			} else {
 				None
 			},
@@ -2625,7 +2633,7 @@ impl<L: Logger> NetworkGraph<L> {
 			check_msg_sanity(channel)?;
 
 			let last_update_message = if msg.excess_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY {
-				full_msg.cloned()
+				full_msg.cloned().map(Box::new)
 			} else {
 				None
 			};
