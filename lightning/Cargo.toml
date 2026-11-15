@@ -24,6 +24,8 @@ _externalize_tests = ["inventory", "_test_utils"]
 unsafe_revoked_tx_signing = []
 
 std = []
+# Lays the network graph's structs out for size rather than x86-64 cache lines.
+compact-graph = []
 
 dnssec = ["dnssec-prover/validation"]
 

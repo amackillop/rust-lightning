@@ -897,7 +897,8 @@ where
 // `align(32)`, ensuring the struct starts either at the start, or in the middle, of an x86-64
 // 64-byte cache line. This ensures the beginning fields (which are 31 bytes) all sit in the same
 // cache line.
-#[repr(C, align(32))]
+// With `compact-graph`, the layout is left to the compiler: no padding, at some cost in cache misses.
+#[cfg_attr(not(feature = "compact-graph"), repr(C, align(32)))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// Details about one direction of a channel as received within a [`ChannelUpdate`].
 pub struct ChannelUpdateInfo {
@@ -1006,7 +1007,8 @@ impl Readable for ChannelUpdateInfo {
 // We accomplish this using `repr(C)`, which forces the struct to be laid out in memory the way we
 // write it (ensuring the fields we care about are at the start of the struct) and `align(128)`,
 // ensuring the struct starts at the beginning of two adjacent 64b x86-64 cache lines.
-#[repr(align(128), C)]
+// With `compact-graph`, the layout is left to the compiler: no padding, at some cost in cache misses.
+#[cfg_attr(not(feature = "compact-graph"), repr(align(128), C))]
 #[derive(Clone, Debug, Eq)]
 /// Details about a channel (both directions).
 /// Received within a channel announcement.
