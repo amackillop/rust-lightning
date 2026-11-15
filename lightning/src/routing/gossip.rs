@@ -1774,12 +1774,23 @@ where
 {
 	/// Creates a new, empty, network graph.
 	pub fn new(network: Network, logger: L) -> NetworkGraph<L> {
+		Self::with_capacity(network, logger, NODE_COUNT_ESTIMATE, CHAN_COUNT_ESTIMATE)
+	}
+
+	/// Creates a new, empty, network graph with room for `node_capacity` nodes and
+	/// `channel_capacity` channels before it reallocates.
+	///
+	/// [`Self::new`] reserves room for the whole public network, which costs far more memory than
+	/// a device holding a partial graph can spare; pass smaller counts, or zero, there.
+	pub fn with_capacity(
+		network: Network, logger: L, node_capacity: usize, channel_capacity: usize,
+	) -> NetworkGraph<L> {
 		Self {
 			secp_ctx: Secp256k1::verification_only(),
 			chain_hash: ChainHash::using_genesis_block(network),
 			logger,
-			channels: RwLock::new(IndexedMap::with_capacity(CHAN_COUNT_ESTIMATE)),
-			nodes: RwLock::new(IndexedMap::with_capacity(NODE_COUNT_ESTIMATE)),
+			channels: RwLock::new(IndexedMap::with_capacity(channel_capacity)),
+			nodes: RwLock::new(IndexedMap::with_capacity(node_capacity)),
 			next_node_counter: AtomicUsize::new(0),
 			removed_node_counters: Mutex::new(Vec::new()),
 			last_rapid_gossip_sync_timestamp: Mutex::new(None),
