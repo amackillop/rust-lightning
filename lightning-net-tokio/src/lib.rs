@@ -45,12 +45,12 @@ use std::net::SocketAddr;
 use std::net::TcpStream as StdTcpStream;
 use std::ops::Deref;
 use std::pin::{pin, Pin};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{self, Poll};
 use std::time::Duration;
 
-static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+// A mutex, as some 32-bit targets with std have no 64-bit atomics.
+static ID_COUNTER: Mutex<u64> = Mutex::new(0);
 
 const CONNECT_OUTBOUND_TIMEOUT: u64 = 10;
 const TOR_CONNECT_OUTBOUND_TIMEOUT: u64 = 30;
@@ -291,7 +291,11 @@ impl Connection {
 		stream.set_nonblocking(true).unwrap();
 		let tokio_stream = Arc::new(TcpStream::from_std(stream).unwrap());
 
-		let id = ID_COUNTER.fetch_add(1, Ordering::AcqRel);
+		let id = {
+			let mut counter = ID_COUNTER.lock().unwrap();
+			*counter += 1;
+			*counter - 1
+		};
 		let writer = Some(Arc::clone(&tokio_stream));
 		let conn = Arc::new(Mutex::new(Self {
 			writer,
