@@ -36,11 +36,12 @@ use crate::persist::{
 	LIQUIDITY_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE, LSPS2_SERVICE_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use crate::prelude::hash_map::Entry;
-use crate::prelude::{new_hash_map, HashMap};
+use crate::prelude::{new_hash_map, HashMap, HashSet};
 use crate::sync::{Arc, Mutex, MutexGuard, RwLock};
 use crate::utils::async_poll::dummy_waker;
 
 use lightning::chain::chaininterface::{BroadcasterInterface, TransactionType};
+use lightning::chain::transaction::OutPoint;
 use lightning::events::HTLCHandlingFailureType;
 use lightning::ln::channelmanager::{AChannelManager, InterceptId};
 use lightning::ln::msgs::{ErrorAction, LightningError};
@@ -590,10 +591,26 @@ impl OutboundJITChannel {
 	}
 }
 
+/// A buy awaiting a splice of a channel with the client.
+#[derive(Clone, Debug, PartialEq)]
+struct PendingSplice {
+	intercept_scid: u64,
+	/// The funding outputs of the splice transactions negotiated for the buy, its RBF attempts
+	/// included. The buy takes the channel once one of them locks.
+	negotiated_funding_txos: Vec<OutPoint>,
+}
+
+impl_writeable_tlv_based!(PendingSplice, {
+	(0, intercept_scid, required),
+	(2, negotiated_funding_txos, required_vec),
+});
+
 pub(crate) struct PeerState {
 	outbound_channels_by_intercept_scid: HashMap<u64, OutboundJITChannel>,
 	intercept_scid_by_user_channel_id: HashMap<u128, u64>,
 	intercept_scid_by_channel_id: HashMap<ChannelId, u64>,
+	/// Buys awaiting a splice of a channel with the client to lock, by that channel.
+	pending_splices_by_channel_id: HashMap<ChannelId, PendingSplice>,
 	pending_requests: HashMap<LSPSRequestId, LSPS2Request>,
 	needs_persist: bool,
 }
@@ -604,12 +621,14 @@ impl PeerState {
 		let pending_requests = new_hash_map();
 		let intercept_scid_by_user_channel_id = new_hash_map();
 		let intercept_scid_by_channel_id = new_hash_map();
+		let pending_splices_by_channel_id = new_hash_map();
 		let needs_persist = false;
 		Self {
 			outbound_channels_by_intercept_scid,
 			pending_requests,
 			intercept_scid_by_user_channel_id,
 			intercept_scid_by_channel_id,
+			pending_splices_by_channel_id,
 			needs_persist,
 		}
 	}
@@ -644,24 +663,68 @@ impl PeerState {
 		});
 	}
 
-	fn remove_terminal_channel_state(&mut self, channel_id: ChannelId) -> Option<u64> {
-		let intercept_scid = self.intercept_scid_by_channel_id.get(&channel_id).copied()?;
-		let should_remove = self
+	/// Removes the state of every JIT channel whose payment was forwarded over `channel_id`.
+	///
+	/// A channel carries several when later buys were spliced into it.
+	fn remove_terminal_channel_state(&mut self, channel_id: ChannelId) -> Vec<u64> {
+		let removed: HashSet<u64> = self
 			.outbound_channels_by_intercept_scid
-			.get(&intercept_scid)
-			.and_then(|entry| entry.get_channel_id())
-			.is_some_and(|existing_channel_id| existing_channel_id == channel_id);
-
-		if !should_remove {
-			return None;
+			.iter()
+			.filter(|(_, entry)| entry.get_channel_id() == Some(channel_id))
+			.map(|(intercept_scid, _)| *intercept_scid)
+			.collect();
+		if removed.is_empty() {
+			return Vec::new();
 		}
 
-		self.outbound_channels_by_intercept_scid.remove(&intercept_scid);
-		self.intercept_scid_by_channel_id.remove(&channel_id);
-		self.intercept_scid_by_user_channel_id.retain(|_, iscid| *iscid != intercept_scid);
+		self.outbound_channels_by_intercept_scid.retain(|iscid, _| !removed.contains(iscid));
+		self.intercept_scid_by_user_channel_id.retain(|_, iscid| !removed.contains(iscid));
+		self.intercept_scid_by_channel_id.retain(|_, iscid| !removed.contains(iscid));
 		self.needs_persist = true;
 
-		Some(intercept_scid)
+		removed.into_iter().collect()
+	}
+
+	/// Resets a JIT channel awaiting its channel so that its payer may try again, returning the
+	/// HTLCs it held, which the caller must fail back.
+	fn reset_pending_channel_open(&mut self, intercept_scid: u64) -> Option<Vec<InterceptedHTLC>> {
+		let entry = self.outbound_channels_by_intercept_scid.get_mut(&intercept_scid)?;
+		let OutboundJITChannelState::PendingChannelOpen { payment_queue, .. } = &mut entry.state
+		else {
+			return None;
+		};
+		let htlcs = payment_queue.clear();
+		entry.state =
+			OutboundJITChannelState::PendingInitialPayment { payment_queue: PaymentQueue::new() };
+		self.needs_persist = true;
+		Some(htlcs)
+	}
+
+	/// Drops the binding of the buy awaiting a splice of `channel_id`, if any, and resets the buy
+	/// as [`Self::reset_pending_channel_open`].
+	fn fail_pending_splice(&mut self, channel_id: &ChannelId) -> Option<Vec<InterceptedHTLC>> {
+		let splice = self.pending_splices_by_channel_id.remove(channel_id)?;
+		self.needs_persist = true;
+		let htlcs = self.reset_pending_channel_open(splice.intercept_scid);
+		debug_assert!(htlcs.is_some(), "A buy awaiting a splice awaits its channel");
+		Some(htlcs.unwrap_or_default())
+	}
+
+	/// Returns the channel the buy with `intercept_scid` awaits a splice of, if any.
+	fn bound_channel(&self, intercept_scid: u64) -> Option<ChannelId> {
+		self.pending_splices_by_channel_id
+			.iter()
+			.find(|(_, splice)| splice.intercept_scid == intercept_scid)
+			.map(|(channel_id, _)| *channel_id)
+	}
+
+	/// Drops the binding of the buy with `intercept_scid` to a splice, returning the channel it was
+	/// bound to if the channel has no other state left.
+	fn unbind_splice(&mut self, intercept_scid: u64) -> Option<ChannelId> {
+		let channel_id = self.bound_channel(intercept_scid)?;
+		self.pending_splices_by_channel_id.remove(&channel_id);
+		self.needs_persist = true;
+		(!self.intercept_scid_by_channel_id.contains_key(&channel_id)).then_some(channel_id)
 	}
 
 	fn pending_requests_and_channels(&self) -> usize {
@@ -684,6 +747,7 @@ impl_writeable_tlv_based!(PeerState, {
 	(0, outbound_channels_by_intercept_scid, required),
 	(2, intercept_scid_by_user_channel_id, required),
 	(4, intercept_scid_by_channel_id, required),
+	(7, pending_splices_by_channel_id, (default_value, new_hash_map())),
 	(_unused, pending_requests, (static_value, new_hash_map())),
 	(_unused, needs_persist, (static_value, false)),
 });
@@ -774,6 +838,17 @@ where
 					));
 				}
 			}
+
+			// A channel awaiting a splice may also carry an earlier buy of the same peer.
+			for (channel_id, _) in peer_state_lock.pending_splices_by_channel_id.iter() {
+				let res = peer_by_channel_id.insert(*channel_id, *node_id);
+				if res.is_some_and(|other_node_id| other_node_id != *node_id) {
+					return Err(lightning::io::Error::new(
+							lightning::io::ErrorKind::InvalidData,
+							"Failed to read LSPS2 peer state due to data inconsistencies: Channel IDs should never collide",
+					));
+				}
+			}
 		}
 
 		Ok(Self {
@@ -794,6 +869,13 @@ where
 	/// Returns a reference to the used config.
 	pub fn config(&self) -> &LSPS2ServiceConfig {
 		&self.config
+	}
+
+	fn fail_intercepted_htlcs<'a>(&self, htlcs: impl IntoIterator<Item = &'a InterceptedHTLC>) {
+		for htlc in htlcs {
+			// A missing intercept has already been released; the LSPS2 state is reset regardless.
+			let _ = self.channel_manager.get_cm().fail_intercepted_htlc(htlc.intercept_id);
+		}
 	}
 
 	/// Returns whether the peer has any active LSPS2 requests.
@@ -1303,20 +1385,34 @@ where
 			return Ok(());
 		};
 
-		let removed_intercept_scid = {
+		let (failed_htlcs, removed_intercept_scids, channel_unmapped) = {
 			let outer_state_lock = self.per_peer_state.read().unwrap();
 			match outer_state_lock.get(&counterparty_node_id) {
 				Some(inner_state_lock) => {
 					let mut peer_state = inner_state_lock.lock().unwrap();
-					peer_state.remove_terminal_channel_state(channel_id)
+					let failed_htlcs = peer_state.fail_pending_splice(&channel_id);
+					let removed_intercept_scids =
+						peer_state.remove_terminal_channel_state(channel_id);
+					let channel_unmapped =
+						!peer_state.intercept_scid_by_channel_id.contains_key(&channel_id);
+					(failed_htlcs, removed_intercept_scids, channel_unmapped)
 				},
-				None => None,
+				None => (None, Vec::new(), false),
 			}
 		};
 
-		if let Some(intercept_scid) = removed_intercept_scid {
-			self.peer_by_intercept_scid.write().unwrap().remove(&intercept_scid);
-			self.peer_by_channel_id.write().unwrap().remove(&channel_id);
+		self.fail_intercepted_htlcs(failed_htlcs.iter().flatten());
+
+		if failed_htlcs.is_some() || !removed_intercept_scids.is_empty() {
+			{
+				let mut peer_by_intercept_scid = self.peer_by_intercept_scid.write().unwrap();
+				for intercept_scid in &removed_intercept_scids {
+					peer_by_intercept_scid.remove(intercept_scid);
+				}
+			}
+			if channel_unmapped {
+				self.peer_by_channel_id.write().unwrap().remove(&channel_id);
+			}
 			self.persist_peer_state(counterparty_node_id).await.map_err(|e| {
 				APIError::APIMisuseError {
 					err: format!(
@@ -1350,7 +1446,7 @@ where
 	pub async fn channel_open_abandoned(
 		&self, counterparty_node_id: &PublicKey, user_channel_id: u128,
 	) -> Result<(), APIError> {
-		{
+		let unbound_channel_id = {
 			let outer_state_lock = self.per_peer_state.read().unwrap();
 			let inner_state_lock = outer_state_lock.get(counterparty_node_id).ok_or_else(|| {
 				APIError::APIMisuseError {
@@ -1391,14 +1487,16 @@ where
 				},
 			};
 
-			for htlc in intercepted_htlcs {
-				let _ = self.channel_manager.get_cm().fail_intercepted_htlc(htlc.intercept_id);
-			}
+			self.fail_intercepted_htlcs(&intercepted_htlcs);
 
 			peer_state.intercept_scid_by_user_channel_id.remove(&user_channel_id);
 			peer_state.outbound_channels_by_intercept_scid.remove(&intercept_scid);
 			peer_state.intercept_scid_by_channel_id.retain(|_, &mut scid| scid != intercept_scid);
 			peer_state.needs_persist |= true;
+			peer_state.unbind_splice(intercept_scid)
+		};
+		if let Some(channel_id) = unbound_channel_id {
+			self.peer_by_channel_id.write().unwrap().remove(&channel_id);
 		}
 
 		self.persist_peer_state(*counterparty_node_id).await.map_err(|e| {
@@ -1420,7 +1518,7 @@ where
 	pub async fn channel_open_failed(
 		&self, counterparty_node_id: &PublicKey, user_channel_id: u128,
 	) -> Result<(), APIError> {
-		{
+		let unbound_channel_id = {
 			let outer_state_lock = self.per_peer_state.read().unwrap();
 
 			let inner_state_lock = outer_state_lock.get(counterparty_node_id).ok_or_else(|| {
@@ -1442,36 +1540,241 @@ where
 					),
 				})?;
 
-			let jit_channel = peer_state
-				.outbound_channels_by_intercept_scid
-				.get_mut(&intercept_scid)
-				.ok_or_else(|| APIError::APIMisuseError {
+			if !peer_state.outbound_channels_by_intercept_scid.contains_key(&intercept_scid) {
+				return Err(APIError::APIMisuseError {
 					err: format!(
 						"Failed to map intercept_scid {} for user_channel_id {} to a channel.",
 						intercept_scid, user_channel_id,
 					),
-				})?;
-
-			if let OutboundJITChannelState::PendingChannelOpen { payment_queue, .. } =
-				&mut jit_channel.state
-			{
-				let intercepted_htlcs = payment_queue.clear();
-				for htlc in intercepted_htlcs {
-					// A missing intercept has already been released; still reset this LSPS2 state.
-					let _ = self.channel_manager.get_cm().fail_intercepted_htlc(htlc.intercept_id);
-				}
-
-				jit_channel.state = OutboundJITChannelState::PendingInitialPayment {
-					payment_queue: PaymentQueue::new(),
-				};
-			} else {
-				return Err(APIError::APIMisuseError {
-					err: "Channel is not in the PendingChannelOpen state.".to_string(),
 				});
 			}
 
+			let intercepted_htlcs = peer_state
+				.reset_pending_channel_open(intercept_scid)
+				.ok_or_else(|| APIError::APIMisuseError {
+					err: "Channel is not in the PendingChannelOpen state.".to_string(),
+				})?;
+			self.fail_intercepted_htlcs(&intercepted_htlcs);
+			peer_state.unbind_splice(intercept_scid)
+		};
+		if let Some(channel_id) = unbound_channel_id {
+			self.peer_by_channel_id.write().unwrap().remove(&channel_id);
+		}
+		self.persist_peer_state(*counterparty_node_id).await.map_err(|e| {
+			APIError::APIMisuseError {
+				err: format!("Failed to persist peer state for {}: {}", counterparty_node_id, e),
+			}
+		})?;
+
+		Ok(())
+	}
+
+	/// Binds a buy to a splice into an existing channel with the client.
+	///
+	/// Call this after receiving an [`LSPS2ServiceEvent::OpenChannel`] event that you serve by
+	/// splicing liquidity into `channel_id` rather than opening a channel, and before initiating
+	/// the splice. Once it is negotiated, report its funding output through
+	/// [`Self::splice_negotiated`]. The binding is persisted, so that the [`Event::ChannelReady`]
+	/// emitted once that splice locks forwards the buy's payment through [`Self::channel_ready`],
+	/// also after a restart. If the splice fails, call
+	/// [`Self::splice_failed`]. If the channel closes first, [`Self::channel_closed`] fails the
+	/// payment back.
+	///
+	/// Returns an error if there is no buy for `user_channel_id` awaiting its channel, if the buy
+	/// uses the client-trusts-LSP model, as LDK broadcasts a splice transaction as soon as
+	/// `tx_signatures` are exchanged, if the buy is bound to another channel, if `channel_id` is
+	/// not a ready channel with the counterparty,
+	/// or if the channel awaits a splice for another buy or carries a buy whose payment has not yet
+	/// been forwarded.
+	///
+	/// [`LSPS2ServiceEvent::OpenChannel`]: crate::lsps2::event::LSPS2ServiceEvent::OpenChannel
+	/// [`Event::ChannelReady`]: lightning::events::Event::ChannelReady
+	pub async fn splice_initiated(
+		&self, counterparty_node_id: &PublicKey, user_channel_id: u128, channel_id: &ChannelId,
+	) -> Result<(), APIError> {
+		let channel_is_ready = self
+			.channel_manager
+			.get_cm()
+			.list_channels_with_counterparty(counterparty_node_id)
+			.iter()
+			.any(|channel| channel.channel_id == *channel_id && channel.is_channel_ready);
+		if !channel_is_ready {
+			return Err(APIError::APIMisuseError {
+				err: format!(
+					"Channel {} is not a ready channel with counterparty {}",
+					channel_id, counterparty_node_id
+				),
+			});
+		}
+
+		{
+			let outer_state_lock = self.per_peer_state.read().unwrap();
+			let inner_state_lock = outer_state_lock.get(counterparty_node_id).ok_or_else(|| {
+				APIError::APIMisuseError {
+					err: format!("No counterparty state for: {}", counterparty_node_id),
+				}
+			})?;
+			let mut peer_state = inner_state_lock.lock().unwrap();
+
+			let intercept_scid = peer_state
+				.intercept_scid_by_user_channel_id
+				.get(&user_channel_id)
+				.copied()
+				.ok_or_else(|| APIError::APIMisuseError {
+					err: format!(
+						"Could not find a channel with user_channel_id {}",
+						user_channel_id
+					),
+				})?;
+
+			let jit_channel = peer_state
+				.outbound_channels_by_intercept_scid
+				.get(&intercept_scid)
+				.filter(|entry| {
+					matches!(entry.state, OutboundJITChannelState::PendingChannelOpen { .. })
+				})
+				.ok_or_else(|| APIError::APIMisuseError {
+					err: "Channel is not in the PendingChannelOpen state.".to_string(),
+				})?;
+			if jit_channel.is_client_trusts_lsp() {
+				return Err(APIError::APIMisuseError {
+					err: "A buy under the client-trusts-LSP model can't be served by a splice, as LDK broadcasts the splice transaction itself".to_string(),
+				});
+			}
+
+			match peer_state.bound_channel(intercept_scid) {
+				Some(bound_channel_id) if bound_channel_id == *channel_id => return Ok(()),
+				Some(bound_channel_id) => {
+					return Err(APIError::APIMisuseError {
+						err: format!(
+							"The buy with user_channel_id {} awaits a splice of channel {}",
+							user_channel_id, bound_channel_id
+						),
+					});
+				},
+				None => {},
+			}
+
+			if peer_state.pending_splices_by_channel_id.contains_key(channel_id) {
+				return Err(APIError::APIMisuseError {
+					err: format!("Channel {} awaits a splice for another buy", channel_id),
+				});
+			}
+			let carries_unforwarded_buy = peer_state
+				.intercept_scid_by_channel_id
+				.get(channel_id)
+				.and_then(|iscid| peer_state.outbound_channels_by_intercept_scid.get(iscid))
+				.is_some_and(|entry| entry.get_channel_id().is_none());
+			if carries_unforwarded_buy {
+				return Err(APIError::APIMisuseError {
+					err: format!(
+						"Channel {} carries a buy whose payment was not yet forwarded",
+						channel_id
+					),
+				});
+			}
+
+			peer_state.pending_splices_by_channel_id.insert(
+				*channel_id,
+				PendingSplice { intercept_scid, negotiated_funding_txos: Vec::new() },
+			);
 			peer_state.needs_persist |= true;
 		}
+		self.peer_by_channel_id.write().unwrap().insert(*channel_id, *counterparty_node_id);
+
+		self.persist_peer_state(*counterparty_node_id).await.map_err(|e| {
+			APIError::APIMisuseError {
+				err: format!("Failed to persist peer state for {}: {}", counterparty_node_id, e),
+			}
+		})?;
+
+		Ok(())
+	}
+
+	/// Records a splice transaction negotiated for a buy bound through [`Self::splice_initiated`].
+	///
+	/// Forward the `channel_id` and `new_funding_txo` of each [`Event::SpliceNegotiated`] for the
+	/// bound channel into this function, those of RBF attempts included. Only a splice reported
+	/// here serves the buy when it locks, so a splice of the channel the counterparty initiated
+	/// does not.
+	///
+	/// Returns an error if no buy awaits a splice of `channel_id`.
+	///
+	/// [`Event::SpliceNegotiated`]: lightning::events::Event::SpliceNegotiated
+	pub async fn splice_negotiated(
+		&self, counterparty_node_id: &PublicKey, channel_id: &ChannelId, new_funding_txo: OutPoint,
+	) -> Result<(), APIError> {
+		{
+			let outer_state_lock = self.per_peer_state.read().unwrap();
+			let inner_state_lock = outer_state_lock.get(counterparty_node_id).ok_or_else(|| {
+				APIError::APIMisuseError {
+					err: format!("No counterparty state for: {}", counterparty_node_id),
+				}
+			})?;
+			let mut peer_state = inner_state_lock.lock().unwrap();
+			let splice =
+				peer_state.pending_splices_by_channel_id.get_mut(channel_id).ok_or_else(|| {
+					APIError::APIMisuseError {
+						err: format!("No buy awaits a splice of channel {}", channel_id),
+					}
+				})?;
+			if splice.negotiated_funding_txos.contains(&new_funding_txo) {
+				return Ok(());
+			}
+			splice.negotiated_funding_txos.push(new_funding_txo);
+			peer_state.needs_persist |= true;
+		}
+
+		self.persist_peer_state(*counterparty_node_id).await.map_err(|e| {
+			APIError::APIMisuseError {
+				err: format!("Failed to persist peer state for {}: {}", counterparty_node_id, e),
+			}
+		})?;
+
+		Ok(())
+	}
+
+	/// Used to fail intercepted HTLCs backwards when a splice bound to a buy through
+	/// [`Self::splice_initiated`] fails before it was negotiated, e.g., as the counterparty
+	/// aborted the negotiation or disconnected before `tx_signatures` were exchanged.
+	///
+	/// Do not call this when an RBF attempt of a negotiated splice fails, as that splice may
+	/// still lock. It resets the buy's state so that the payer may try the payment again.
+	///
+	/// Returns an error if no buy awaits a splice of `channel_id`, or if a splice was negotiated for
+	/// it through [`Self::splice_negotiated`].
+	pub async fn splice_failed(
+		&self, counterparty_node_id: &PublicKey, channel_id: &ChannelId,
+	) -> Result<(), APIError> {
+		let failed_htlcs = {
+			let outer_state_lock = self.per_peer_state.read().unwrap();
+			let inner_state_lock = outer_state_lock.get(counterparty_node_id).ok_or_else(|| {
+				APIError::APIMisuseError {
+					err: format!("No counterparty state for: {}", counterparty_node_id),
+				}
+			})?;
+			let mut peer_state = inner_state_lock.lock().unwrap();
+			let none_negotiated = peer_state
+				.pending_splices_by_channel_id
+				.get(channel_id)
+				.ok_or_else(|| APIError::APIMisuseError {
+					err: format!("No buy awaits a splice of channel {}", channel_id),
+				})?
+				.negotiated_funding_txos
+				.is_empty();
+			if !none_negotiated {
+				return Err(APIError::APIMisuseError {
+					err: format!(
+						"A splice of channel {} was negotiated for the buy and may still lock",
+						channel_id
+					),
+				});
+			}
+			peer_state.fail_pending_splice(channel_id).unwrap_or_default()
+		};
+
+		self.fail_intercepted_htlcs(&failed_htlcs);
+
 		self.persist_peer_state(*counterparty_node_id).await.map_err(|e| {
 			APIError::APIMisuseError {
 				err: format!("Failed to persist peer state for {}: {}", counterparty_node_id, e),
@@ -1486,9 +1789,14 @@ where
 	/// Will forward the intercepted HTLC if it matches a channel
 	/// we need to forward a payment over otherwise it will be ignored.
 	///
+	/// A buy bound through [`Self::splice_initiated`] is served once `funding_txo` is a splice
+	/// reported through [`Self::splice_negotiated`]. Otherwise the buy is found by `channel_id`
+	/// when the channel has one, as for a replayed event, and by `user_channel_id` if not.
+	///
 	/// [`Event::ChannelReady`]: lightning::events::Event::ChannelReady
 	pub async fn channel_ready(
 		&self, user_channel_id: u128, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
+		funding_txo: Option<OutPoint>,
 	) -> Result<(), APIError> {
 		let mut should_persist = false;
 		{
@@ -1498,19 +1806,43 @@ where
 		match self.per_peer_state.read().unwrap().get(counterparty_node_id) {
 			Some(inner_state_lock) => {
 				let mut peer_state = inner_state_lock.lock().unwrap();
-				if let Some(intercept_scid) =
-					peer_state.intercept_scid_by_user_channel_id.get(&user_channel_id).copied()
-				{
-					should_persist |= true;
-					peer_state.intercept_scid_by_channel_id.insert(*channel_id, intercept_scid);
-					if let Some(jit_channel) =
-						peer_state.outbound_channels_by_intercept_scid.get_mut(&intercept_scid)
-					{
-						match jit_channel.channel_ready(*channel_id) {
+				// The splice's event carries the channel's `user_channel_id`, not the buy's.
+				let spliced_intercept_scid = peer_state
+					.pending_splices_by_channel_id
+					.get(channel_id)
+					.filter(|splice| {
+						funding_txo.is_some_and(|txo| splice.negotiated_funding_txos.contains(&txo))
+					})
+					.map(|splice| splice.intercept_scid);
+				let intercept_scid = spliced_intercept_scid
+					.or_else(|| peer_state.intercept_scid_by_channel_id.get(channel_id).copied())
+					.or_else(|| {
+						peer_state.intercept_scid_by_user_channel_id.get(&user_channel_id).copied()
+					});
+				if let Some(intercept_scid) = intercept_scid {
+					if spliced_intercept_scid.is_none() {
+						should_persist |= true;
+						peer_state.intercept_scid_by_channel_id.insert(*channel_id, intercept_scid);
+					}
+					let transition = peer_state
+						.outbound_channels_by_intercept_scid
+						.get_mut(&intercept_scid)
+						.map(|jit_channel| jit_channel.channel_ready(*channel_id));
+					if let Some(transition) = transition {
+						match transition {
 							Ok(ForwardPaymentAction(
 								channel_id,
 								FeePayment { opening_fee_msat, htlcs },
 							)) => {
+								if spliced_intercept_scid.is_some() {
+									peer_state.pending_splices_by_channel_id.remove(&channel_id);
+									peer_state
+										.intercept_scid_by_channel_id
+										.insert(channel_id, intercept_scid);
+									// Recorded before forwarding, which may return early.
+									peer_state.needs_persist = true;
+									should_persist = true;
+								}
 								let amounts_to_forward_msat =
 									calculate_amount_to_forward_per_htlc(&htlcs, opening_fee_msat);
 
@@ -2431,6 +2763,66 @@ where
 		}
 	}
 
+	/// Binds a buy to a splice into an existing channel with the client.
+	///
+	/// Wraps [`LSPS2ServiceHandler::splice_initiated`].
+	pub fn splice_initiated(
+		&self, counterparty_node_id: &PublicKey, user_channel_id: u128, channel_id: &ChannelId,
+	) -> Result<(), APIError> {
+		let mut fut =
+			pin!(self.inner.splice_initiated(counterparty_node_id, user_channel_id, channel_id));
+
+		let mut waker = dummy_waker();
+		let mut ctx = task::Context::from_waker(&mut waker);
+		match fut.as_mut().poll(&mut ctx) {
+			task::Poll::Ready(result) => result,
+			task::Poll::Pending => {
+				// In a sync context, we can't wait for the future to complete.
+				unreachable!("Should not be pending in a sync context");
+			},
+		}
+	}
+
+	/// Records a splice transaction negotiated for a buy bound through
+	/// [`LSPS2ServiceHandler::splice_initiated`].
+	///
+	/// Wraps [`LSPS2ServiceHandler::splice_negotiated`].
+	pub fn splice_negotiated(
+		&self, counterparty_node_id: &PublicKey, channel_id: &ChannelId, new_funding_txo: OutPoint,
+	) -> Result<(), APIError> {
+		let mut fut =
+			pin!(self.inner.splice_negotiated(counterparty_node_id, channel_id, new_funding_txo));
+
+		let mut waker = dummy_waker();
+		let mut ctx = task::Context::from_waker(&mut waker);
+		match fut.as_mut().poll(&mut ctx) {
+			task::Poll::Ready(result) => result,
+			task::Poll::Pending => {
+				// In a sync context, we can't wait for the future to complete.
+				unreachable!("Should not be pending in a sync context");
+			},
+		}
+	}
+
+	/// Used to fail intercepted HTLCs backwards when a splice bound to a buy fails.
+	///
+	/// Wraps [`LSPS2ServiceHandler::splice_failed`].
+	pub fn splice_failed(
+		&self, counterparty_node_id: &PublicKey, channel_id: &ChannelId,
+	) -> Result<(), APIError> {
+		let mut fut = pin!(self.inner.splice_failed(counterparty_node_id, channel_id));
+
+		let mut waker = dummy_waker();
+		let mut ctx = task::Context::from_waker(&mut waker);
+		match fut.as_mut().poll(&mut ctx) {
+			task::Poll::Ready(result) => result,
+			task::Poll::Pending => {
+				// In a sync context, we can't wait for the future to complete.
+				unreachable!("Should not be pending in a sync context");
+			},
+		}
+	}
+
 	/// Forward [`Event::ChannelReady`] event parameters into this function.
 	///
 	/// Wraps [`LSPS2ServiceHandler::channel_ready`].
@@ -2438,9 +2830,14 @@ where
 	/// [`Event::ChannelReady`]: lightning::events::Event::ChannelReady
 	pub fn channel_ready(
 		&self, user_channel_id: u128, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
+		funding_txo: Option<OutPoint>,
 	) -> Result<(), APIError> {
-		let mut fut =
-			pin!(self.inner.channel_ready(user_channel_id, channel_id, counterparty_node_id));
+		let mut fut = pin!(self.inner.channel_ready(
+			user_channel_id,
+			channel_id,
+			counterparty_node_id,
+			funding_txo
+		));
 
 		let mut waker = dummy_waker();
 		let mut ctx = task::Context::from_waker(&mut waker);
@@ -2460,7 +2857,8 @@ mod tests {
 
 	use crate::lsps0::ser::LSPSDateTime;
 
-	use bitcoin::{absolute::LockTime, transaction::Version};
+	use bitcoin::hashes::Hash;
+	use bitcoin::{absolute::LockTime, transaction::Version, Txid};
 	use core::str::FromStr;
 	use lightning::io::Cursor;
 	use lightning::util::ser::{Readable, Writeable};
@@ -2956,7 +3354,7 @@ mod tests {
 
 		assert_eq!(
 			peer_state.remove_terminal_channel_state(stale_channel_id),
-			Some(stale_intercept_scid)
+			vec![stale_intercept_scid]
 		);
 		assert!(!peer_state
 			.outbound_channels_by_intercept_scid
@@ -2975,8 +3373,108 @@ mod tests {
 		assert!(peer_state.needs_persist);
 
 		peer_state.needs_persist = false;
-		assert_eq!(peer_state.remove_terminal_channel_state(stale_channel_id), None);
+		assert!(peer_state.remove_terminal_channel_state(stale_channel_id).is_empty());
 		assert!(!peer_state.needs_persist);
+	}
+
+	fn spliced_peer_state() -> (PeerState, ChannelId, u64, u64) {
+		let opening_fee_params = LSPS2OpeningFeeParams {
+			min_fee_msat: 10_000_000,
+			proportional: 10_000,
+			valid_until: LSPSDateTime::from_str("2035-05-20T08:30:45Z").unwrap(),
+			min_lifetime: 4032,
+			max_client_to_self_delay: 2016,
+			min_payment_size_msat: 10_000_000,
+			max_payment_size_msat: 1_000_000_000,
+			promise: "ignore".to_string(),
+		};
+		let channel_id = ChannelId([44; 32]);
+		let (opened_intercept_scid, opened_user_channel_id) = (42, 43);
+		let (spliced_intercept_scid, spliced_user_channel_id) = (45, 46);
+
+		let mut opened = OutboundJITChannel::new(
+			None,
+			opening_fee_params.clone(),
+			opened_user_channel_id,
+			false,
+		);
+		opened.state = OutboundJITChannelState::PaymentForwarded { channel_id };
+		let mut spliced =
+			OutboundJITChannel::new(None, opening_fee_params, spliced_user_channel_id, false);
+		spliced.state = OutboundJITChannelState::PendingChannelOpen {
+			payment_queue: PaymentQueue::new(),
+			opening_fee_msat: 10_000_000,
+		};
+
+		let mut peer_state = PeerState::new();
+		peer_state.insert_outbound_channel(opened_intercept_scid, opened);
+		peer_state.insert_outbound_channel(spliced_intercept_scid, spliced);
+		peer_state
+			.intercept_scid_by_user_channel_id
+			.insert(opened_user_channel_id, opened_intercept_scid);
+		peer_state
+			.intercept_scid_by_user_channel_id
+			.insert(spliced_user_channel_id, spliced_intercept_scid);
+		peer_state.intercept_scid_by_channel_id.insert(channel_id, opened_intercept_scid);
+		peer_state.pending_splices_by_channel_id.insert(
+			channel_id,
+			PendingSplice {
+				intercept_scid: spliced_intercept_scid,
+				negotiated_funding_txos: vec![OutPoint { txid: Txid::all_zeros(), index: 0 }],
+			},
+		);
+		peer_state.needs_persist = false;
+		(peer_state, channel_id, opened_intercept_scid, spliced_intercept_scid)
+	}
+
+	#[test]
+	fn a_failed_splice_resets_its_buy_and_leaves_the_channel_to_its_buy() {
+		let (mut peer_state, channel_id, opened_intercept_scid, spliced_intercept_scid) =
+			spliced_peer_state();
+		assert!(peer_state.fail_pending_splice(&channel_id).unwrap().is_empty());
+		assert!(peer_state.outbound_channels_by_intercept_scid[&spliced_intercept_scid]
+			.is_pending_initial_payment());
+		assert!(peer_state.pending_splices_by_channel_id.is_empty());
+		assert_eq!(
+			peer_state.intercept_scid_by_channel_id.get(&channel_id),
+			Some(&opened_intercept_scid)
+		);
+		assert!(peer_state.needs_persist);
+		assert!(peer_state.fail_pending_splice(&channel_id).is_none());
+	}
+
+	#[test]
+	fn a_closed_channel_drops_every_buy_forwarded_over_it() {
+		let (mut peer_state, channel_id, opened_intercept_scid, spliced_intercept_scid) =
+			spliced_peer_state();
+		peer_state.pending_splices_by_channel_id.clear();
+		peer_state
+			.outbound_channels_by_intercept_scid
+			.get_mut(&spliced_intercept_scid)
+			.unwrap()
+			.state = OutboundJITChannelState::PaymentForwarded { channel_id };
+		peer_state.intercept_scid_by_channel_id.insert(channel_id, spliced_intercept_scid);
+
+		let mut removed = peer_state.remove_terminal_channel_state(channel_id);
+		removed.sort_unstable();
+		assert_eq!(removed, vec![opened_intercept_scid, spliced_intercept_scid]);
+		assert!(peer_state.outbound_channels_by_intercept_scid.is_empty());
+		assert!(peer_state.intercept_scid_by_user_channel_id.is_empty());
+		assert!(peer_state.intercept_scid_by_channel_id.is_empty());
+	}
+
+	#[test]
+	fn a_pending_splice_survives_a_restart() {
+		let (peer_state, channel_id, _, spliced_intercept_scid) = spliced_peer_state();
+		let decoded = PeerState::read(&mut Cursor::new(&peer_state.encode())).unwrap();
+		assert_eq!(
+			decoded.pending_splices_by_channel_id.get(&channel_id),
+			peer_state.pending_splices_by_channel_id.get(&channel_id)
+		);
+		assert_eq!(
+			decoded.pending_splices_by_channel_id[&channel_id].intercept_scid,
+			spliced_intercept_scid
+		);
 	}
 
 	#[test]

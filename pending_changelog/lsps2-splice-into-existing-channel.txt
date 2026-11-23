@@ -1,0 +1,10 @@
+# API Updates
+
+ * An LSPS2 service can serve a buy by splicing into an existing channel with the client
+   instead of opening a new one: call `LSPS2ServiceHandler::splice_initiated` after the
+   `OpenChannel` event and before initiating the splice, forward each `Event::SpliceNegotiated`
+   for the channel to `splice_negotiated`, and call `splice_failed` if the splice fails before
+   it was negotiated.
+
+ * `LSPS2ServiceHandler::channel_ready` now takes the `funding_txo` of the `Event::ChannelReady`
+   it is called for.

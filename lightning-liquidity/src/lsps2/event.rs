@@ -161,12 +161,18 @@ pub enum LSPS2ServiceEvent {
 	},
 	/// You should open a channel using [`ChannelManager::create_channel`].
 	///
+	/// If you already have a channel with the client, you may instead splice the liquidity into
+	/// it. In that case, call [`LSPS2ServiceHandler::splice_initiated`] before initiating the
+	/// splice with [`ChannelManager::splice_channel`].
+	///
 	/// **Note: ** As this event is persisted and might get replayed after restart, you'll need to
 	/// ensure channel creation idempotency. I.e., please check if you already created a
 	/// corresponding channel based on the given `their_network_key` and `user_channel_id` and
 	/// ignore this event in case you did.
 	///
 	/// [`ChannelManager::create_channel`]: lightning::ln::channelmanager::ChannelManager::create_channel
+	/// [`ChannelManager::splice_channel`]: lightning::ln::channelmanager::ChannelManager::splice_channel
+	/// [`LSPS2ServiceHandler::splice_initiated`]: crate::lsps2::service::LSPS2ServiceHandler::splice_initiated
 	OpenChannel {
 		/// The node to open channel with.
 		their_network_key: PublicKey,

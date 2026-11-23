@@ -29,12 +29,17 @@ use lightning_liquidity::lsps2::utils::is_valid_opening_fee_params;
 use lightning_liquidity::utils::time::{DefaultTimeProvider, TimeProvider};
 use lightning_liquidity::{LiquidityClientConfig, LiquidityManagerSync, LiquidityServiceConfig};
 
+use lightning::chain::channelmonitor::ANTI_REORG_DELAY;
+use lightning::chain::transaction::OutPoint;
 use lightning::ln::channelmanager::{InterceptId, MIN_FINAL_CLTV_EXPIRY_DELTA};
 use lightning::ln::functional_test_utils::{
 	create_chanmon_cfgs, create_node_cfgs, create_node_chanmgrs,
 };
 use lightning::ln::functional_test_utils::{create_network, Node};
 use lightning::ln::peer_handler::CustomMessageHandler;
+use lightning::ln::splicing_tests::{
+	do_initiate_splice_in, lock_splice_after_blocks, splice_channel,
+};
 use lightning::log_error;
 use lightning::routing::router::{RouteHint, RouteHintHop};
 use lightning::sign::NodeSigner;
@@ -48,7 +53,7 @@ use lightning_invoice::{Bolt11Invoice, InvoiceBuilder, RoutingFees};
 use lightning_types::payment::PaymentHash;
 
 use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
-use bitcoin::Network;
+use bitcoin::{Amount, Network};
 use lightning_types::payment::PaymentPreimage;
 
 use std::str::FromStr;
@@ -1661,7 +1666,7 @@ fn client_trusts_lsp_end_to_end_test() {
 		true,
 	);
 
-	service_handler.channel_ready(user_channel_id, &channel_id, &client_node_id).unwrap();
+	service_handler.channel_ready(user_channel_id, &channel_id, &client_node_id, None).unwrap();
 
 	service_node.inner.node.process_pending_htlc_forwards();
 
@@ -1740,6 +1745,23 @@ fn execute_lsps2_dance(
 	lsps_nodes: &LSPSNodesWithPayer, intercept_scid: u64, user_channel_id: u128,
 	cltv_expiry_delta: u32, promise_secret: [u8; 32], payment_size_msat: Option<u64>,
 	fee_base_msat: u64,
+) {
+	execute_lsps2_dance_with_trust_model(
+		lsps_nodes,
+		intercept_scid,
+		user_channel_id,
+		cltv_expiry_delta,
+		promise_secret,
+		payment_size_msat,
+		fee_base_msat,
+		true,
+	)
+}
+
+fn execute_lsps2_dance_with_trust_model(
+	lsps_nodes: &LSPSNodesWithPayer, intercept_scid: u64, user_channel_id: u128,
+	cltv_expiry_delta: u32, promise_secret: [u8; 32], payment_size_msat: Option<u64>,
+	fee_base_msat: u64, client_trusts_lsp: bool,
 ) {
 	let service_node = &lsps_nodes.service_node;
 	let client_node = &lsps_nodes.client_node;
@@ -1835,8 +1857,6 @@ fn execute_lsps2_dance(
 	} else {
 		panic!("Unexpected event");
 	}
-
-	let client_trusts_lsp = true;
 
 	service_handler
 		.invoice_parameters_generated(
@@ -2111,7 +2131,7 @@ fn late_payment_forwarded_and_safe_after_force_close_does_not_broadcast() {
 		false,
 	);
 
-	service_handler.channel_ready(user_channel_id, &channel_id, &client_node_id).unwrap();
+	service_handler.channel_ready(user_channel_id, &channel_id, &client_node_id, None).unwrap();
 	service_node.inner.node.process_pending_htlc_forwards();
 
 	// Run forward to client and let client claim. do not notify service handler yet.
@@ -2303,7 +2323,7 @@ fn htlc_timeout_before_client_claim_results_in_handling_failed() {
 		true,
 	);
 
-	service_handler.channel_ready(user_channel_id, &channel_id, &client_node_id).unwrap();
+	service_handler.channel_ready(user_channel_id, &channel_id, &client_node_id, None).unwrap();
 	service_node.inner.node.process_pending_htlc_forwards();
 
 	// Forward to client, but do not claim yet
@@ -2660,7 +2680,7 @@ fn client_trusts_lsp_partial_fee_does_not_trigger_broadcast() {
 		true,
 	);
 
-	service_handler.channel_ready(user_channel_id, &channel_id, &client_node_id).unwrap();
+	service_handler.channel_ready(user_channel_id, &channel_id, &client_node_id, None).unwrap();
 
 	service_node.inner.node.process_pending_htlc_forwards();
 
@@ -2750,4 +2770,379 @@ fn client_trusts_lsp_partial_fee_does_not_trigger_broadcast() {
 	service_node.inner.chain_monitor.added_monitors.lock().unwrap().clear();
 	client_node.inner.chain_monitor.added_monitors.lock().unwrap().clear();
 	payer_node.chain_monitor.added_monitors.lock().unwrap().clear();
+}
+
+/// Runs a buy up to the service's `OpenChannel` event: the client buys a JIT channel with
+/// `user_channel_id` under the LSP-trusts-client model, and the payer pays its invoice.
+fn buy_until_open_channel(
+	lsps_nodes: &LSPSNodesWithPayer, promise_secret: [u8; 32], user_channel_id: u128,
+	description: &str,
+) -> (u64, InterceptId) {
+	buy_until_open_channel_with_trust_model(
+		lsps_nodes,
+		promise_secret,
+		user_channel_id,
+		description,
+		false,
+	)
+}
+
+fn buy_until_open_channel_with_trust_model(
+	lsps_nodes: &LSPSNodesWithPayer, promise_secret: [u8; 32], user_channel_id: u128,
+	description: &str, client_trusts_lsp: bool,
+) -> (u64, InterceptId) {
+	let LSPSNodesWithPayer { ref service_node, ref client_node, ref payer_node } = lsps_nodes;
+	let payer_node_id = payer_node.node.get_our_node_id();
+	let service_node_id = service_node.inner.node.get_our_node_id();
+	let service_handler = service_node.liquidity_manager.lsps2_service_handler().unwrap();
+
+	let intercept_scid = service_node.node.get_intercept_scid();
+	let cltv_expiry_delta: u32 = 144;
+	let payment_size_msat = Some(1_000_000);
+	execute_lsps2_dance_with_trust_model(
+		lsps_nodes,
+		intercept_scid,
+		user_channel_id,
+		cltv_expiry_delta,
+		promise_secret,
+		payment_size_msat,
+		1_000,
+		client_trusts_lsp,
+	);
+
+	let invoice = create_jit_invoice(
+		&client_node,
+		service_node_id,
+		intercept_scid,
+		cltv_expiry_delta,
+		payment_size_msat,
+		description,
+		3600,
+	)
+	.unwrap();
+	payer_node
+		.node
+		.pay_for_bolt11_invoice(
+			&invoice,
+			PaymentId(invoice.payment_hash().0),
+			None,
+			OptionalBolt11PaymentParams::default(),
+		)
+		.unwrap();
+
+	check_added_monitors(&payer_node, 1);
+	let events = payer_node.node.get_and_clear_pending_msg_events();
+	let ev = SendEvent::from_event(events[0].clone());
+	service_node.inner.node.handle_update_add_htlc(payer_node_id, &ev.msgs[0]);
+	do_commitment_signed_dance(&service_node.inner, &payer_node, &ev.commitment_msg, false, true);
+	service_node.inner.node.process_pending_htlc_forwards();
+
+	let events = service_node.inner.node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	let intercept_id = match &events[0] {
+		Event::HTLCIntercepted {
+			intercept_id,
+			requested_next_hop_scid,
+			payment_hash,
+			expected_outbound_amount_msat,
+			inbound_amount_msat,
+			..
+		} => {
+			service_handler
+				.htlc_intercepted(
+					*requested_next_hop_scid,
+					*intercept_id,
+					*expected_outbound_amount_msat,
+					*payment_hash,
+					*inbound_amount_msat,
+				)
+				.unwrap();
+			*intercept_id
+		},
+		other => panic!("Expected HTLCIntercepted, got {:?}", other),
+	};
+
+	match service_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS2Service(LSPS2ServiceEvent::OpenChannel {
+			user_channel_id: ucid,
+			..
+		}) => assert_eq!(ucid, user_channel_id),
+		other => panic!("Unexpected event: {:?}", other),
+	};
+
+	(intercept_scid, intercept_id)
+}
+
+fn setup_spliceable_lsps2_nodes<'a, 'b, 'c>(
+	nodes: Vec<Node<'a, 'b, 'c>>,
+) -> (LSPSNodesWithPayer<'a, 'b, 'c>, [u8; 32], ChannelId, u128) {
+	let (lsps_nodes, promise_secret) = setup_test_lsps2_nodes_with_payer(nodes);
+	create_chan_between_nodes_with_value(
+		&lsps_nodes.payer_node,
+		&lsps_nodes.service_node.inner,
+		2_000_000,
+		100_000,
+	);
+	let (_, _, _, channel_id, _) = create_chan_between_nodes_with_value(
+		&lsps_nodes.service_node.inner,
+		&lsps_nodes.client_node.inner,
+		1_000_000,
+		0,
+	);
+	let channel_user_channel_id = lsps_nodes
+		.service_node
+		.node
+		.list_channels()
+		.into_iter()
+		.find(|channel| channel.channel_id == channel_id)
+		.unwrap()
+		.user_channel_id;
+	(lsps_nodes, promise_secret, channel_id, channel_user_channel_id)
+}
+
+#[test]
+fn splice_into_existing_channel_forwards_once_locked() {
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let mut service_node_config = test_default_channel_config();
+	service_node_config.htlc_interception_flags = HTLCInterceptionFlags::ToInterceptSCIDs as u8;
+	let mut client_node_config = test_default_channel_config();
+	client_node_config.channel_config.accept_underpaying_htlcs = true;
+	let node_chanmgrs = create_node_chanmgrs(
+		3,
+		&node_cfgs,
+		&[Some(service_node_config), Some(client_node_config), None],
+	);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+	let (lsps_nodes, promise_secret, channel_id, channel_user_channel_id) =
+		setup_spliceable_lsps2_nodes(nodes);
+	let LSPSNodesWithPayer { ref service_node, ref client_node, .. } = lsps_nodes;
+	let service_node_id = service_node.inner.node.get_our_node_id();
+	let client_node_id = client_node.inner.node.get_our_node_id();
+	let service_handler = service_node.liquidity_manager.lsps2_service_handler().unwrap();
+
+	let buy_user_channel_id = 7;
+	assert_ne!(buy_user_channel_id, channel_user_channel_id);
+	buy_until_open_channel(&lsps_nodes, promise_secret, buy_user_channel_id, "splice");
+
+	let prior_funding_txo = service_node
+		.node
+		.list_channels()
+		.into_iter()
+		.find(|channel| channel.channel_id == channel_id)
+		.and_then(|channel| channel.funding_txo)
+		.unwrap();
+	service_handler.splice_initiated(&client_node_id, buy_user_channel_id, &channel_id).unwrap();
+	// Binding the same buy again, e.g. on a replayed event, is a no-op.
+	service_handler.splice_initiated(&client_node_id, buy_user_channel_id, &channel_id).unwrap();
+
+	provide_utxo_reserves(core::slice::from_ref(&service_node.inner), 1, Amount::ONE_BTC);
+	// The other nodes follow the service to the height its splice transaction is locked to.
+	connect_blocks(&client_node.inner, 1);
+	connect_blocks(&lsps_nodes.payer_node, 1);
+	let contribution = do_initiate_splice_in(
+		&service_node.inner,
+		&client_node.inner,
+		channel_id,
+		Amount::from_sat(100_000),
+	);
+	let (splice_tx, new_funding_script) =
+		splice_channel(&service_node.inner, &client_node.inner, channel_id, contribution);
+	let new_funding_txo = OutPoint {
+		txid: splice_tx.compute_txid(),
+		index: splice_tx
+			.output
+			.iter()
+			.position(|output| output.script_pubkey == new_funding_script)
+			.unwrap() as u16,
+	};
+
+	// Nothing is forwarded before the splice locks, and a `ChannelReady` replayed meanwhile, from
+	// before the splice, leaves the buy bound to it.
+	assert!(service_handler
+		.channel_ready(
+			channel_user_channel_id,
+			&channel_id,
+			&client_node_id,
+			Some(prior_funding_txo)
+		)
+		.is_err());
+	service_node.inner.node.process_pending_htlc_forwards();
+	assert!(service_node.inner.node.get_and_clear_pending_msg_events().is_empty());
+
+	mine_transaction(&service_node.inner, &splice_tx);
+	mine_transaction(&client_node.inner, &splice_tx);
+	lock_splice_after_blocks(&service_node.inner, &client_node.inner, ANTI_REORG_DELAY - 1);
+
+	// Until its funding is reported as negotiated for the buy, a splice that locked is not the
+	// buy's.
+	assert!(service_handler
+		.channel_ready(channel_user_channel_id, &channel_id, &client_node_id, Some(new_funding_txo))
+		.is_err());
+	service_handler.splice_negotiated(&client_node_id, &channel_id, new_funding_txo).unwrap();
+	// Once negotiated, the splice can't be failed: it may still lock.
+	assert!(service_handler.splice_failed(&client_node_id, &channel_id).is_err());
+
+	// The splice's `ChannelReady` carries the channel's `user_channel_id`, not the buy's.
+	service_handler
+		.channel_ready(channel_user_channel_id, &channel_id, &client_node_id, Some(new_funding_txo))
+		.unwrap();
+	service_node.inner.node.process_pending_htlc_forwards();
+
+	let pay_event = {
+		check_added_monitors(&service_node.inner, 1);
+		let mut events = service_node.inner.node.get_and_clear_pending_msg_events();
+		assert_eq!(events.len(), 1);
+		SendEvent::from_event(events.remove(0))
+	};
+	client_node.inner.node.handle_update_add_htlc(service_node_id, &pay_event.msgs[0]);
+	do_commitment_signed_dance(
+		&client_node.inner,
+		&service_node.inner,
+		&pay_event.commitment_msg,
+		false,
+		true,
+	);
+	client_node.inner.node.process_pending_htlc_forwards();
+
+	let client_events = client_node.inner.node.get_and_clear_pending_events();
+	assert_eq!(client_events.len(), 1);
+	assert!(matches!(client_events[0], Event::PaymentClaimable { .. }));
+
+	// A replayed `ChannelReady` finds the spliced buy, which is past it, rather than rebinding the
+	// channel to the buy its `user_channel_id` names.
+	assert!(service_handler
+		.channel_ready(channel_user_channel_id, &channel_id, &client_node_id, Some(new_funding_txo))
+		.is_err());
+	service_node.inner.node.process_pending_htlc_forwards();
+	assert!(service_node.inner.node.get_and_clear_pending_msg_events().is_empty());
+
+	// The client has not claimed, so the buy's payment is not yet forwarded and the channel can't
+	// take another buy.
+	buy_until_open_channel(&lsps_nodes, promise_secret, 8, "second");
+	assert!(service_handler.splice_initiated(&client_node_id, 8, &channel_id).is_err());
+}
+
+#[test]
+fn splice_failed_fails_the_buy_back_so_it_can_be_paid_again() {
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let mut service_node_config = test_default_channel_config();
+	service_node_config.htlc_interception_flags = HTLCInterceptionFlags::ToInterceptSCIDs as u8;
+	let node_chanmgrs =
+		create_node_chanmgrs(3, &node_cfgs, &[Some(service_node_config), None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+	let (lsps_nodes, promise_secret, channel_id, channel_user_channel_id) =
+		setup_spliceable_lsps2_nodes(nodes);
+	let client_node_id = lsps_nodes.client_node.inner.node.get_our_node_id();
+	let service_node = &lsps_nodes.service_node;
+	let service_handler = service_node.liquidity_manager.lsps2_service_handler().unwrap();
+
+	let buy_user_channel_id = 7;
+	let (intercept_scid, intercept_id) =
+		buy_until_open_channel(&lsps_nodes, promise_secret, buy_user_channel_id, "splice-failed");
+	service_handler.splice_initiated(&client_node_id, buy_user_channel_id, &channel_id).unwrap();
+
+	service_handler.splice_failed(&client_node_id, &channel_id).unwrap();
+
+	assert!(service_node.inner.node.fail_intercepted_htlc(intercept_id).is_err());
+	let events = service_node.inner.node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	match &events[0] {
+		Event::HTLCHandlingFailed {
+			failure_type: HTLCHandlingFailureType::InvalidForward { requested_forward_scid },
+			..
+		} => assert_eq!(*requested_forward_scid, intercept_scid),
+		other => panic!("Expected HTLCHandlingFailed, got {:?}", other),
+	}
+
+	// The buy no longer awaits the splice: a later `ChannelReady` for the channel is not its.
+	assert!(service_handler.splice_failed(&client_node_id, &channel_id).is_err());
+	assert!(service_handler
+		.channel_ready(channel_user_channel_id, &channel_id, &client_node_id, None)
+		.is_err());
+}
+
+#[test]
+fn splice_initiated_refuses_a_channel_carrying_an_unforwarded_buy() {
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let mut service_node_config = test_default_channel_config();
+	service_node_config.htlc_interception_flags = HTLCInterceptionFlags::ToInterceptSCIDs as u8;
+	let node_chanmgrs =
+		create_node_chanmgrs(3, &node_cfgs, &[Some(service_node_config), None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+	let (lsps_nodes, promise_secret, channel_id, _) = setup_spliceable_lsps2_nodes(nodes);
+	let client_node_id = lsps_nodes.client_node.inner.node.get_our_node_id();
+	let service_handler =
+		lsps_nodes.service_node.liquidity_manager.lsps2_service_handler().unwrap();
+
+	buy_until_open_channel(&lsps_nodes, promise_secret, 7, "first");
+	buy_until_open_channel(&lsps_nodes, promise_secret, 8, "second");
+
+	// Only a ready channel with the client can be spliced into.
+	assert!(service_handler.splice_initiated(&client_node_id, 7, &ChannelId([9; 32])).is_err());
+
+	service_handler.splice_initiated(&client_node_id, 7, &channel_id).unwrap();
+	assert!(service_handler.splice_initiated(&client_node_id, 8, &channel_id).is_err());
+
+	// A buy that is not awaiting its channel can't be bound at all.
+	assert!(service_handler.splice_initiated(&client_node_id, 9, &channel_id).is_err());
+
+	// Abandoning the bound buy frees the channel for another.
+	service_handler.channel_open_abandoned(&client_node_id, 7).unwrap();
+	let events = lsps_nodes.service_node.inner.node.get_and_clear_pending_events();
+	assert!(matches!(events[..], [Event::HTLCHandlingFailed { .. }]));
+	service_handler.splice_initiated(&client_node_id, 8, &channel_id).unwrap();
+}
+
+#[test]
+fn splice_initiated_refuses_a_buy_under_the_client_trusts_lsp_model() {
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let mut service_node_config = test_default_channel_config();
+	service_node_config.htlc_interception_flags = HTLCInterceptionFlags::ToInterceptSCIDs as u8;
+	let node_chanmgrs =
+		create_node_chanmgrs(3, &node_cfgs, &[Some(service_node_config), None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+	let (lsps_nodes, promise_secret, channel_id, _) = setup_spliceable_lsps2_nodes(nodes);
+	let client_node_id = lsps_nodes.client_node.inner.node.get_our_node_id();
+	let service_handler =
+		lsps_nodes.service_node.liquidity_manager.lsps2_service_handler().unwrap();
+
+	buy_until_open_channel_with_trust_model(&lsps_nodes, promise_secret, 7, "trusted", true);
+	assert!(service_handler.splice_initiated(&client_node_id, 7, &channel_id).is_err());
+}
+
+#[test]
+fn a_closed_channel_fails_its_pending_splice_back() {
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let mut service_node_config = test_default_channel_config();
+	service_node_config.htlc_interception_flags = HTLCInterceptionFlags::ToInterceptSCIDs as u8;
+	let node_chanmgrs =
+		create_node_chanmgrs(3, &node_cfgs, &[Some(service_node_config), None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+	let (lsps_nodes, promise_secret, channel_id, _) = setup_spliceable_lsps2_nodes(nodes);
+	let client_node_id = lsps_nodes.client_node.inner.node.get_our_node_id();
+	let service_node = &lsps_nodes.service_node;
+	let service_handler = service_node.liquidity_manager.lsps2_service_handler().unwrap();
+
+	let (intercept_scid, intercept_id) =
+		buy_until_open_channel(&lsps_nodes, promise_secret, 7, "closed");
+	service_handler.splice_initiated(&client_node_id, 7, &channel_id).unwrap();
+
+	service_handler.channel_closed(channel_id).unwrap();
+
+	assert!(service_node.inner.node.fail_intercepted_htlc(intercept_id).is_err());
+	let events = service_node.inner.node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	match &events[0] {
+		Event::HTLCHandlingFailed {
+			failure_type: HTLCHandlingFailureType::InvalidForward { requested_forward_scid },
+			..
+		} => assert_eq!(*requested_forward_scid, intercept_scid),
+		other => panic!("Expected HTLCHandlingFailed, got {:?}", other),
+	}
+	assert!(service_handler.splice_failed(&client_node_id, &channel_id).is_err());
 }
