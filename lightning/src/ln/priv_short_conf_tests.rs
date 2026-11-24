@@ -1297,7 +1297,10 @@ fn test_0conf_channel_reorg() {
 	assert_eq!(ev.len(), 1);
 	let ev = ev.pop().unwrap();
 	let path = &[&nodes[1]];
-	let failure = HTLCHandlingFailureType::InvalidForward { requested_forward_scid: original_scid };
+	let failure = HTLCHandlingFailureType::InvalidForward {
+		requested_forward_scid: original_scid,
+		intercept_id: None,
+	};
 	let args =
 		PassAlongPathArgs::new(&nodes[0], path, 10_000, payment_hash, ev).expect_failure(failure);
 	do_pass_along_path(args);

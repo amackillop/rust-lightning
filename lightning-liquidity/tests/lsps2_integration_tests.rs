@@ -585,9 +585,13 @@ fn channel_open_failed_releases_intercepted_htlcs() {
 	assert_eq!(events.len(), 1);
 	match &events[0] {
 		Event::HTLCHandlingFailed {
-			failure_type: HTLCHandlingFailureType::InvalidForward { requested_forward_scid },
+			failure_type:
+				HTLCHandlingFailureType::InvalidForward { requested_forward_scid, intercept_id: id },
 			..
-		} => assert_eq!(*requested_forward_scid, intercept_scid),
+		} => {
+			assert_eq!(*requested_forward_scid, intercept_scid);
+			assert_eq!(*id, Some(intercept_id));
+		},
 		other => panic!("Expected HTLCHandlingFailed, got {:?}", other),
 	}
 }
@@ -699,9 +703,13 @@ fn htlc_declaring_more_than_delivered_is_failed_back() {
 	assert_eq!(events.len(), 1);
 	match &events[0] {
 		Event::HTLCHandlingFailed {
-			failure_type: HTLCHandlingFailureType::InvalidForward { requested_forward_scid, .. },
+			failure_type:
+				HTLCHandlingFailureType::InvalidForward { requested_forward_scid, intercept_id: id },
 			..
-		} => assert_eq!(*requested_forward_scid, intercept_scid),
+		} => {
+			assert_eq!(*requested_forward_scid, intercept_scid);
+			assert_eq!(*id, Some(intercept_id));
+		},
 		other => panic!("Expected HTLCHandlingFailed, got {:?}", other),
 	}
 	// ... and is no longer pending with the channel manager ...
@@ -952,9 +960,13 @@ fn channel_open_abandoned_releases_intercepted_htlcs() {
 	assert_eq!(events.len(), 1);
 	match &events[0] {
 		Event::HTLCHandlingFailed {
-			failure_type: HTLCHandlingFailureType::InvalidForward { requested_forward_scid },
+			failure_type:
+				HTLCHandlingFailureType::InvalidForward { requested_forward_scid, intercept_id: id },
 			..
-		} => assert_eq!(*requested_forward_scid, intercept_scid),
+		} => {
+			assert_eq!(*requested_forward_scid, intercept_scid);
+			assert_eq!(*id, Some(intercept_id));
+		},
 		other => panic!("Expected HTLCHandlingFailed, got {:?}", other),
 	}
 }
@@ -3051,9 +3063,13 @@ fn splice_failed_fails_the_buy_back_so_it_can_be_paid_again() {
 	assert_eq!(events.len(), 1);
 	match &events[0] {
 		Event::HTLCHandlingFailed {
-			failure_type: HTLCHandlingFailureType::InvalidForward { requested_forward_scid },
+			failure_type:
+				HTLCHandlingFailureType::InvalidForward { requested_forward_scid, intercept_id: id },
 			..
-		} => assert_eq!(*requested_forward_scid, intercept_scid),
+		} => {
+			assert_eq!(*requested_forward_scid, intercept_scid);
+			assert_eq!(*id, Some(intercept_id));
+		},
 		other => panic!("Expected HTLCHandlingFailed, got {:?}", other),
 	}
 
@@ -3140,9 +3156,13 @@ fn a_closed_channel_fails_its_pending_splice_back() {
 	assert_eq!(events.len(), 1);
 	match &events[0] {
 		Event::HTLCHandlingFailed {
-			failure_type: HTLCHandlingFailureType::InvalidForward { requested_forward_scid },
+			failure_type:
+				HTLCHandlingFailureType::InvalidForward { requested_forward_scid, intercept_id: id },
 			..
-		} => assert_eq!(*requested_forward_scid, intercept_scid),
+		} => {
+			assert_eq!(*requested_forward_scid, intercept_scid);
+			assert_eq!(*id, Some(intercept_id));
+		},
 		other => panic!("Expected HTLCHandlingFailed, got {:?}", other),
 	}
 	assert!(service_handler.splice_failed(&client_node_id, &channel_id).is_err());

@@ -1,0 +1,11 @@
+# API Updates
+
+ * `HTLCHandlingFailureType::InvalidForward` now includes an `intercept_id` field naming the
+   `InterceptId` a held HTLC was held under when it is failed back, whether through
+   `ChannelManager::fail_intercepted_htlc` or as it neared its expiry. It is `None` for an HTLC
+   that was never held. Code that constructs or destructures the variant must name the field.
+
+# Backwards Compatibility
+
+ * An `Event::HTLCHandlingFailed` persisted with an `intercept_id` and read by an earlier version
+   loses the `intercept_id`.

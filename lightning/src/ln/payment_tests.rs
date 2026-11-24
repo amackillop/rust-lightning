@@ -2576,8 +2576,10 @@ fn do_test_intercepted_payment(test: InterceptTest) {
 	if test == InterceptTest::Fail {
 		// Ensure we can fail the intercepted payment back.
 		nodes[1].node.fail_intercepted_htlc(intercept_id).unwrap();
-		let fail =
-			HTLCHandlingFailureType::InvalidForward { requested_forward_scid: intercept_scid };
+		let fail = HTLCHandlingFailureType::InvalidForward {
+			requested_forward_scid: intercept_scid,
+			intercept_id: Some(intercept_id),
+		};
 		expect_htlc_failure_conditions(nodes[1].node.get_and_clear_pending_events(), &[fail]);
 		nodes[1].node.process_pending_htlc_forwards();
 		let update_fail = get_htlc_update_msgs(&nodes[1], &node_a_id);
@@ -2669,8 +2671,10 @@ fn do_test_intercepted_payment(test: InterceptTest) {
 			connect_block(&nodes[0], &block);
 			connect_block(&nodes[1], &block);
 		}
-		let fail_type =
-			HTLCHandlingFailureType::InvalidForward { requested_forward_scid: intercept_scid };
+		let fail_type = HTLCHandlingFailureType::InvalidForward {
+			requested_forward_scid: intercept_scid,
+			intercept_id: Some(intercept_id),
+		};
 		expect_and_process_pending_htlcs_and_htlc_handling_failed(&nodes[1], &[fail_type]);
 		check_added_monitors(&nodes[1], 1);
 
@@ -4337,7 +4341,8 @@ fn test_threaded_payment_retries() {
 		expect_htlc_handling_failed_destinations!(
 			nodes[1].node.get_and_clear_pending_events(),
 			&[HTLCHandlingFailureType::InvalidForward {
-				requested_forward_scid: route.paths[0].hops[1].short_channel_id
+				requested_forward_scid: route.paths[0].hops[1].short_channel_id,
+				intercept_id: None,
 			}]
 		);
 		check_added_monitors(&nodes[1], 1);

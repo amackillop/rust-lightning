@@ -7543,7 +7543,7 @@ impl<
 		if let PendingHTLCRouting::Forward { short_channel_id, .. } = payment.forward_info.routing {
 			let htlc_source = HTLCSource::PreviousHopData(payment.htlc_previous_hop_data());
 			let reason = HTLCFailReason::from_failure_code(LocalHTLCFailureReason::UnknownNextPeer);
-			let destination = HTLCHandlingFailureType::InvalidForward { requested_forward_scid: short_channel_id };
+			let destination = HTLCHandlingFailureType::InvalidForward { requested_forward_scid: short_channel_id, intercept_id: Some(intercept_id) };
 			let hash = payment.forward_info.payment_hash;
 			self.fail_htlc_backwards_internal(&htlc_source, &hash, &reason, destination, None);
 		} else { unreachable!() } // Only `PendingHTLCRouting::Forward`s are intercepted
@@ -7576,6 +7576,7 @@ impl<
 					},
 					None => HTLCHandlingFailureType::InvalidForward {
 						requested_forward_scid: outgoing_scid,
+						intercept_id: None,
 					},
 				}
 			} else {
@@ -8056,6 +8057,7 @@ impl<
 							let failure_type = if next_hop_unknown {
 								HTLCHandlingFailureType::InvalidForward {
 									requested_forward_scid: short_chan_id,
+									intercept_id: None,
 								}
 							} else {
 								HTLCHandlingFailureType::Receive { payment_hash }
@@ -16878,7 +16880,7 @@ impl<
 			);
 
 			let mut intercepted_htlcs = self.pending_intercepted_htlcs.lock().unwrap();
-			intercepted_htlcs.retain(|_, htlc| {
+			intercepted_htlcs.retain(|intercept_id, htlc| {
 				if height >= htlc.forward_info.outgoing_cltv_value - HTLC_FAIL_BACK_BUFFER {
 					let prev_hop_data = HTLCSource::PreviousHopData(htlc.htlc_previous_hop_data());
 					let requested_forward_scid /* intercept scid */ = match htlc.forward_info.routing {
@@ -16891,7 +16893,10 @@ impl<
 						HTLCFailReason::from_failure_code(
 							LocalHTLCFailureReason::ForwardExpiryBuffer,
 						),
-						HTLCHandlingFailureType::InvalidForward { requested_forward_scid },
+						HTLCHandlingFailureType::InvalidForward {
+							requested_forward_scid,
+							intercept_id: Some(*intercept_id),
+						},
 					));
 					let logger = WithContext::from(
 						&self.logger,

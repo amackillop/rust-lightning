@@ -766,6 +766,16 @@ pub enum HTLCHandlingFailureType {
 	InvalidForward {
 		/// Short channel id we are requesting to forward an HTLC to.
 		requested_forward_scid: u64,
+		/// The id the HTLC was held under, if it was failed after being held: on
+		/// [`ChannelManager::fail_intercepted_htlc`], or as it neared its expiry. For an HTLC held
+		/// for interception, this is the id [`Event::HTLCIntercepted`] named; an HTLC held until an
+		/// async payment's recipient comes online is held under an id too.
+		///
+		/// This field will be `None` for an HTLC that was never held, and for objects serialized
+		/// before it was added.
+		///
+		/// [`ChannelManager::fail_intercepted_htlc`]: crate::ln::channelmanager::ChannelManager::fail_intercepted_htlc
+		intercept_id: Option<InterceptId>,
 	},
 	/// We couldn't decode the incoming onion to obtain the forwarding details.
 	InvalidOnion,
@@ -796,6 +806,7 @@ impl_writeable_tlv_based_enum_upgradable!(HTLCHandlingFailureType,
 	},
 	(1, InvalidForward) => {
 		(0, requested_forward_scid, required),
+		(1, intercept_id, option),
 	},
 	(2, UnknownNextHop) => {
 		(0, requested_forward_scid, required),
@@ -3183,6 +3194,7 @@ impl MaybeReadable for Event {
 					{
 						failure_type_opt.0 = Some(HTLCHandlingFailureType::InvalidForward {
 							requested_forward_scid,
+							intercept_id: None,
 						});
 						failure_reason = Some(LocalHTLCFailureReason::UnknownNextPeer.into());
 					}
@@ -3435,6 +3447,22 @@ impl MaybeReadable for Event {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn htlc_handling_failed_round_trips_the_intercept_id() {
+		for intercept_id in [Some(InterceptId([42; 32])), None] {
+			let event = Event::HTLCHandlingFailed {
+				prev_channel_ids: vec![ChannelId::from_bytes([1; 32])],
+				failure_type: HTLCHandlingFailureType::InvalidForward {
+					requested_forward_scid: 42,
+					intercept_id,
+				},
+				failure_reason: Some(LocalHTLCFailureReason::ForwardExpiryBuffer.into()),
+			};
+			let decoded = Event::read(&mut &event.encode()[..]).unwrap().unwrap();
+			assert_eq!(decoded, event);
+		}
+	}
 
 	#[test]
 	fn legacy_payment_forwarded_preserves_unknown_inbound_htlc_amount() {
