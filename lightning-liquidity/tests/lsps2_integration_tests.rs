@@ -24,7 +24,7 @@ use lightning_liquidity::lsps2::client::LSPS2ClientConfig;
 use lightning_liquidity::lsps2::event::LSPS2ClientEvent;
 use lightning_liquidity::lsps2::event::LSPS2ServiceEvent;
 use lightning_liquidity::lsps2::msgs::LSPS2RawOpeningFeeParams;
-use lightning_liquidity::lsps2::service::LSPS2ServiceConfig;
+use lightning_liquidity::lsps2::service::{BuyAwaitingChannel, LSPS2ServiceConfig};
 use lightning_liquidity::lsps2::utils::is_valid_opening_fee_params;
 use lightning_liquidity::utils::time::{DefaultTimeProvider, TimeProvider};
 use lightning_liquidity::{LiquidityClientConfig, LiquidityManagerSync, LiquidityServiceConfig};
@@ -52,6 +52,7 @@ use lightning_invoice::{Bolt11Invoice, InvoiceBuilder, RoutingFees};
 
 use lightning_types::payment::PaymentHash;
 
+use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use bitcoin::{Amount, Network};
 use lightning_types::payment::PaymentPreimage;
@@ -3145,4 +3146,49 @@ fn a_closed_channel_fails_its_pending_splice_back() {
 		other => panic!("Expected HTLCHandlingFailed, got {:?}", other),
 	}
 	assert!(service_handler.splice_failed(&client_node_id, &channel_id).is_err());
+}
+
+#[test]
+fn a_buy_awaits_a_channel_until_it_has_one_or_a_splice() {
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let mut service_node_config = test_default_channel_config();
+	service_node_config.htlc_interception_flags = HTLCInterceptionFlags::ToInterceptSCIDs as u8;
+	let node_chanmgrs =
+		create_node_chanmgrs(3, &node_cfgs, &[Some(service_node_config), None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+	let (lsps_nodes, promise_secret, channel_id, _) = setup_spliceable_lsps2_nodes(nodes);
+	let client_node_id = lsps_nodes.client_node.inner.node.get_our_node_id();
+	let service_node = &lsps_nodes.service_node;
+	let service_handler = service_node.liquidity_manager.lsps2_service_handler().unwrap();
+
+	assert!(service_handler.buys_awaiting_channel(&client_node_id).is_empty());
+	let (intercept_scid, intercept_id) =
+		buy_until_open_channel(&lsps_nodes, promise_secret, 7, "await");
+	let awaiting = BuyAwaitingChannel {
+		user_channel_id: 7,
+		intercept_scid,
+		amt_to_forward_msat: 999_000,
+		opening_fee_msat: 1_000,
+	};
+	assert_eq!(service_handler.buys_awaiting_channel(&client_node_id), vec![awaiting.clone()]);
+
+	service_handler.splice_initiated(&client_node_id, 7, &channel_id).unwrap();
+	assert!(service_handler.buys_awaiting_channel(&client_node_id).is_empty());
+
+	// A splice that never started leaves the buy awaiting a channel, its HTLCs still held.
+	service_handler.splice_abandoned(&client_node_id, &channel_id).unwrap();
+	assert_eq!(service_handler.buys_awaiting_channel(&client_node_id), vec![awaiting]);
+	assert!(service_node.inner.node.get_and_clear_pending_events().is_empty());
+
+	// Once a splice was negotiated it can't be abandoned, as it may still lock.
+	service_handler.splice_initiated(&client_node_id, 7, &channel_id).unwrap();
+	let negotiated = OutPoint { txid: bitcoin::Txid::from_byte_array([1; 32]), index: 0 };
+	service_handler.splice_negotiated(&client_node_id, &channel_id, negotiated).unwrap();
+	assert!(service_handler.splice_abandoned(&client_node_id, &channel_id).is_err());
+
+	// The intercepted HTLC was held throughout: releasing it now still succeeds.
+	service_node.inner.node.fail_intercepted_htlc(intercept_id).unwrap();
+	let events = service_node.inner.node.get_and_clear_pending_events();
+	assert!(matches!(events[..], [Event::HTLCHandlingFailed { .. }]));
 }

@@ -66,6 +66,11 @@ impl PaymentQueue {
 		position.map(|position| self.payments.remove(position))
 	}
 
+	/// The total expected outbound amount of the first queued payment.
+	pub(crate) fn first_payment_msat(&self) -> Option<u64> {
+		self.payments.first().map(|entry| Self::payment_status(entry).0)
+	}
+
 	pub(crate) fn clear(&mut self) -> Vec<InterceptedHTLC> {
 		self.payments.drain(..).map(|entry| entry.htlcs).flatten().collect()
 	}

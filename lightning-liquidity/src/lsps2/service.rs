@@ -199,7 +199,15 @@ enum OutboundJITChannelState {
 	PendingInitialPayment { payment_queue: PaymentQueue },
 	/// An initial payment of sufficient size was intercepted to the JIT channel SCID, triggering the
 	/// opening of the channel. We are awaiting the completion of the channel establishment.
-	PendingChannelOpen { payment_queue: PaymentQueue, opening_fee_msat: u64 },
+	PendingChannelOpen {
+		payment_queue: PaymentQueue,
+		opening_fee_msat: u64,
+		/// The amount the [`LSPS2ServiceEvent::OpenChannel`] event named, or `None` for state
+		/// persisted before it was recorded.
+		///
+		/// [`LSPS2ServiceEvent::OpenChannel`]: crate::lsps2::event::LSPS2ServiceEvent::OpenChannel
+		amt_to_forward_msat: Option<u64>,
+	},
 	/// The channel is open and a payment was forwarded while skimming the JIT channel fee.
 	/// No further payments can be forwarded until the pending payment succeeds or fails, as we need
 	/// to know whether the JIT channel fee needs to be skimmed from a next payment or not.
@@ -277,6 +285,7 @@ impl OutboundJITChannelState {
 					*self = OutboundJITChannelState::PendingChannelOpen {
 						payment_queue: core::mem::take(payment_queue),
 						opening_fee_msat,
+						amt_to_forward_msat: Some(amt_to_forward_msat),
 					};
 					let open_channel = HTLCInterceptedAction::OpenChannel(OpenChannelParams {
 						opening_fee_msat,
@@ -296,12 +305,17 @@ impl OutboundJITChannelState {
 					}
 				}
 			},
-			OutboundJITChannelState::PendingChannelOpen { payment_queue, opening_fee_msat } => {
+			OutboundJITChannelState::PendingChannelOpen {
+				payment_queue,
+				opening_fee_msat,
+				amt_to_forward_msat,
+			} => {
 				let mut payment_queue = core::mem::take(payment_queue);
 				payment_queue.add_htlc(htlc);
 				*self = OutboundJITChannelState::PendingChannelOpen {
 					payment_queue,
 					opening_fee_msat: *opening_fee_msat,
+					amt_to_forward_msat: *amt_to_forward_msat,
 				};
 				Ok(None)
 			},
@@ -358,7 +372,9 @@ impl OutboundJITChannelState {
 		&mut self, channel_id: ChannelId,
 	) -> Result<ForwardPaymentAction, ChannelStateError> {
 		match self {
-			OutboundJITChannelState::PendingChannelOpen { payment_queue, opening_fee_msat } => {
+			OutboundJITChannelState::PendingChannelOpen {
+				payment_queue, opening_fee_msat, ..
+			} => {
 				if let Some(entry) = payment_queue.pop_greater_than_msat(*opening_fee_msat) {
 					let forward_payment = ForwardPaymentAction(
 						channel_id,
@@ -475,6 +491,7 @@ impl_writeable_tlv_based_enum!(OutboundJITChannelState,
 	},
 	(2, PendingChannelOpen) => {
 		(0, payment_queue, required),
+		(1, amt_to_forward_msat, option),
 		(2, opening_fee_msat, required),
 	},
 	(4, PendingPaymentForward) => {
@@ -509,6 +526,33 @@ impl_writeable_tlv_based!(OutboundJITChannel, {
 });
 
 impl OutboundJITChannel {
+	/// The buy's [`BuyAwaitingChannel`] view while it awaits its channel.
+	fn awaiting_channel(&self, intercept_scid: u64) -> Option<BuyAwaitingChannel> {
+		let OutboundJITChannelState::PendingChannelOpen {
+			payment_queue,
+			opening_fee_msat,
+			amt_to_forward_msat,
+		} = &self.state
+		else {
+			return None;
+		};
+		// Recomputed as on interception, from the payment that triggered the open, for state that
+		// did not record it.
+		let amt_to_forward_msat = amt_to_forward_msat.or_else(|| {
+			let payment_size_msat =
+				self.payment_size_msat.or_else(|| payment_queue.first_payment_msat())?;
+			Some(payment_size_msat.saturating_sub(*opening_fee_msat))
+		});
+		debug_assert!(amt_to_forward_msat.is_some(), "A buy awaiting its channel holds a payment");
+		let amt_to_forward_msat = amt_to_forward_msat?;
+		Some(BuyAwaitingChannel {
+			user_channel_id: self.user_channel_id,
+			intercept_scid,
+			amt_to_forward_msat,
+			opening_fee_msat: *opening_fee_msat,
+		})
+	}
+
 	fn new(
 		payment_size_msat: Option<u64>, opening_fee_params: LSPS2OpeningFeeParams,
 		user_channel_id: u128, client_trusts_lsp: bool,
@@ -589,6 +633,24 @@ impl OutboundJITChannel {
 	fn is_client_trusts_lsp(&self) -> bool {
 		self.trust_model.is_client_trusts_lsp()
 	}
+}
+
+/// A buy whose [`LSPS2ServiceEvent::OpenChannel`] event was emitted but which neither has a channel
+/// nor is bound to a splice, as returned by [`LSPS2ServiceHandler::buys_awaiting_channel`].
+///
+/// [`LSPS2ServiceEvent::OpenChannel`]: crate::lsps2::event::LSPS2ServiceEvent::OpenChannel
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuyAwaitingChannel {
+	/// The `user_channel_id` of the buy's [`LSPS2ServiceEvent::OpenChannel`] event.
+	///
+	/// [`LSPS2ServiceEvent::OpenChannel`]: crate::lsps2::event::LSPS2ServiceEvent::OpenChannel
+	pub user_channel_id: u128,
+	/// The intercept SCID of the buy.
+	pub intercept_scid: u64,
+	/// The amount to forward to the client once its channel is ready.
+	pub amt_to_forward_msat: u64,
+	/// The fee to skim from the forwarded payment.
+	pub opening_fee_msat: u64,
 }
 
 /// A buy awaiting a splice of a channel with the client.
@@ -1691,6 +1753,91 @@ where
 		Ok(())
 	}
 
+	/// Returns the buys of `counterparty_node_id` whose [`LSPS2ServiceEvent::OpenChannel`] event
+	/// was emitted but which neither have a channel nor are bound to a splice.
+	///
+	/// [`LSPS2ServiceEvent::OpenChannel`] events are not replayed once handled, so use this to
+	/// resume buys you deferred, e.g., to wait for an existing channel with the client to become
+	/// usable, after a restart or when the client reconnects. A buy whose channel you are already
+	/// opening is listed too, until [`Self::channel_ready`] is called for it, and so is a buy whose
+	/// event is still queued, so handling a listed buy must be idempotent with handling its event,
+	/// as a replayed event's must be.
+	///
+	/// [`LSPS2ServiceEvent::OpenChannel`]: crate::lsps2::event::LSPS2ServiceEvent::OpenChannel
+	pub fn buys_awaiting_channel(
+		&self, counterparty_node_id: &PublicKey,
+	) -> Vec<BuyAwaitingChannel> {
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+		let Some(inner_state_lock) = outer_state_lock.get(counterparty_node_id) else {
+			return Vec::new();
+		};
+		let peer_state = inner_state_lock.lock().unwrap();
+		let bound: HashSet<u64> = peer_state
+			.pending_splices_by_channel_id
+			.values()
+			.map(|splice| splice.intercept_scid)
+			.collect();
+		peer_state
+			.outbound_channels_by_intercept_scid
+			.iter()
+			.filter(|(intercept_scid, _)| !bound.contains(*intercept_scid))
+			.filter_map(|(intercept_scid, entry)| entry.awaiting_channel(*intercept_scid))
+			.collect()
+	}
+
+	/// Unbinds a buy from a splice that was never started, leaving the buy awaiting its channel
+	/// with its HTLCs held.
+	///
+	/// Call this only when initiating the splice failed, i.e. [`ChannelManager::splice_channel`] or
+	/// [`ChannelManager::funding_contributed`] returned an error, e.g., as the channel stopped being
+	/// usable. Once initiated, a splice ends in [`Self::splice_negotiated`] or [`Self::splice_failed`].
+	///
+	/// [`ChannelManager::splice_channel`]: lightning::ln::channelmanager::ChannelManager::splice_channel
+	/// [`ChannelManager::funding_contributed`]: lightning::ln::channelmanager::ChannelManager::funding_contributed
+	///
+	/// Returns an error if no buy awaits a splice of `channel_id`, or if a splice was negotiated for
+	/// it through [`Self::splice_negotiated`].
+	pub async fn splice_abandoned(
+		&self, counterparty_node_id: &PublicKey, channel_id: &ChannelId,
+	) -> Result<(), APIError> {
+		let unbound_channel_id = {
+			let outer_state_lock = self.per_peer_state.read().unwrap();
+			let inner_state_lock = outer_state_lock.get(counterparty_node_id).ok_or_else(|| {
+				APIError::APIMisuseError {
+					err: format!("No counterparty state for: {}", counterparty_node_id),
+				}
+			})?;
+			let mut peer_state = inner_state_lock.lock().unwrap();
+			let splice =
+				peer_state.pending_splices_by_channel_id.get(channel_id).ok_or_else(|| {
+					APIError::APIMisuseError {
+						err: format!("No buy awaits a splice of channel {}", channel_id),
+					}
+				})?;
+			if !splice.negotiated_funding_txos.is_empty() {
+				return Err(APIError::APIMisuseError {
+					err: format!(
+						"A splice of channel {} was negotiated for the buy and may still lock",
+						channel_id
+					),
+				});
+			}
+			let intercept_scid = splice.intercept_scid;
+			peer_state.unbind_splice(intercept_scid)
+		};
+		if let Some(channel_id) = unbound_channel_id {
+			self.peer_by_channel_id.write().unwrap().remove(&channel_id);
+		}
+
+		self.persist_peer_state(*counterparty_node_id).await.map_err(|e| {
+			APIError::APIMisuseError {
+				err: format!("Failed to persist peer state for {}: {}", counterparty_node_id, e),
+			}
+		})?;
+
+		Ok(())
+	}
+
 	/// Records a splice transaction negotiated for a buy bound through [`Self::splice_initiated`].
 	///
 	/// Forward the `channel_id` and `new_funding_txo` of each [`Event::SpliceNegotiated`] for the
@@ -2783,6 +2930,34 @@ where
 		}
 	}
 
+	/// Returns the buys of `counterparty_node_id` awaiting a channel.
+	///
+	/// Wraps [`LSPS2ServiceHandler::buys_awaiting_channel`].
+	pub fn buys_awaiting_channel(
+		&self, counterparty_node_id: &PublicKey,
+	) -> Vec<BuyAwaitingChannel> {
+		self.inner.buys_awaiting_channel(counterparty_node_id)
+	}
+
+	/// Unbinds a buy from a splice that was never started.
+	///
+	/// Wraps [`LSPS2ServiceHandler::splice_abandoned`].
+	pub fn splice_abandoned(
+		&self, counterparty_node_id: &PublicKey, channel_id: &ChannelId,
+	) -> Result<(), APIError> {
+		let mut fut = pin!(self.inner.splice_abandoned(counterparty_node_id, channel_id));
+
+		let mut waker = dummy_waker();
+		let mut ctx = task::Context::from_waker(&mut waker);
+		match fut.as_mut().poll(&mut ctx) {
+			task::Poll::Ready(result) => result,
+			task::Poll::Pending => {
+				// In a sync context, we can't wait for the future to complete.
+				unreachable!("Should not be pending in a sync context");
+			},
+		}
+	}
+
 	/// Records a splice transaction negotiated for a buy bound through
 	/// [`LSPS2ServiceHandler::splice_initiated`].
 	///
@@ -3404,6 +3579,7 @@ mod tests {
 		spliced.state = OutboundJITChannelState::PendingChannelOpen {
 			payment_queue: PaymentQueue::new(),
 			opening_fee_msat: 10_000_000,
+			amt_to_forward_msat: Some(90_000_000),
 		};
 
 		let mut peer_state = PeerState::new();
@@ -3475,6 +3651,68 @@ mod tests {
 			decoded.pending_splices_by_channel_id[&channel_id].intercept_scid,
 			spliced_intercept_scid
 		);
+	}
+
+	#[test]
+	fn a_variable_amount_buy_recomputes_its_amount_from_the_triggering_payment() {
+		let (mut peer_state, _, _, spliced_intercept_scid) = spliced_peer_state();
+		let entry = peer_state
+			.outbound_channels_by_intercept_scid
+			.get_mut(&spliced_intercept_scid)
+			.unwrap();
+		let htlc = |id: u8, amount_msat| InterceptedHTLC {
+			intercept_id: InterceptId([id; 32]),
+			expected_outbound_amount_msat: amount_msat,
+			payment_hash: PaymentHash([id; 32]),
+		};
+		let mut payment_queue = PaymentQueue::new();
+		payment_queue.add_htlc(htlc(1, 50_000_000));
+		payment_queue.add_htlc(htlc(2, 80_000_000));
+		entry.payment_size_msat = None;
+		entry.state = OutboundJITChannelState::PendingChannelOpen {
+			payment_queue,
+			opening_fee_msat: 10_000_000,
+			amt_to_forward_msat: None,
+		};
+		let awaiting = entry.awaiting_channel(spliced_intercept_scid).unwrap();
+		assert_eq!(awaiting.amt_to_forward_msat, 40_000_000);
+	}
+
+	#[test]
+	fn the_recorded_amount_survives_a_restart_and_older_state_reads_without_it() {
+		for amt_to_forward_msat in [Some(90_000_000), None] {
+			let state = OutboundJITChannelState::PendingChannelOpen {
+				payment_queue: PaymentQueue::new(),
+				opening_fee_msat: 10_000_000,
+				amt_to_forward_msat,
+			};
+			let decoded = OutboundJITChannelState::read(&mut Cursor::new(&state.encode())).unwrap();
+			match decoded {
+				OutboundJITChannelState::PendingChannelOpen {
+					amt_to_forward_msat: decoded,
+					..
+				} => assert_eq!(decoded, amt_to_forward_msat),
+				other => panic!("Unexpected state {:?}", other),
+			}
+		}
+	}
+
+	#[test]
+	fn a_buy_persisted_before_its_amount_was_recorded_recomputes_it() {
+		let (mut peer_state, _, _, spliced_intercept_scid) = spliced_peer_state();
+		let entry = peer_state
+			.outbound_channels_by_intercept_scid
+			.get_mut(&spliced_intercept_scid)
+			.unwrap();
+		entry.payment_size_msat = Some(100_000_000);
+		entry.state = OutboundJITChannelState::PendingChannelOpen {
+			payment_queue: PaymentQueue::new(),
+			opening_fee_msat: 10_000_000,
+			amt_to_forward_msat: None,
+		};
+		let awaiting = entry.awaiting_channel(spliced_intercept_scid).unwrap();
+		assert_eq!(awaiting.amt_to_forward_msat, 90_000_000);
+		assert_eq!(awaiting.opening_fee_msat, 10_000_000);
 	}
 
 	#[test]

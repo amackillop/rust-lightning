@@ -8,3 +8,8 @@
 
  * `LSPS2ServiceHandler::channel_ready` now takes the `funding_txo` of the `Event::ChannelReady`
    it is called for.
+
+ * `LSPS2ServiceHandler::buys_awaiting_channel` lists the buys whose `OpenChannel` event was
+   emitted but which have neither a channel nor a splice, for an integrator that deferred them to
+   resume after a restart. `splice_abandoned` unbinds a buy from a splice that never started,
+   leaving the buy awaiting its channel.
