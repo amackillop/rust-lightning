@@ -1,0 +1,6 @@
+# Bug Fixes
+
+ * In "MPP+fixed-invoice" mode, an LSPS2 service no longer forwards part of a payment as the fee
+   payment: neither a partial payment queued ahead of the one that triggered the channel open,
+   nor the first part of a payment arriving after a fee payment failed. Only a payment whose
+   parts total `payment_size_msat` is forwarded, and a partial one is held, as before the open.
