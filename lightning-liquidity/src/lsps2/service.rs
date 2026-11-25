@@ -42,7 +42,7 @@ use crate::utils::async_poll::dummy_waker;
 
 use lightning::chain::chaininterface::{BroadcasterInterface, TransactionType};
 use lightning::chain::transaction::OutPoint;
-use lightning::events::HTLCHandlingFailureType;
+use lightning::events::{HTLCHandlingFailureType, InboundHTLCLocator};
 use lightning::ln::channelmanager::{AChannelManager, InterceptId};
 use lightning::ln::msgs::{ErrorAction, LightningError};
 use lightning::ln::types::ChannelId;
@@ -221,6 +221,9 @@ enum OutboundJITChannelState {
 		/// The part of the opening fee that was skimmed from the parts of the pending payment
 		/// that have been claimed so far.
 		collected_fee_msat: u64,
+		/// The HTLCs of the pending payment, by which its forwarding events are told from those of
+		/// other HTLCs over the channel. Empty for state persisted before they were recorded.
+		fee_payment_htlcs: Vec<InterceptId>,
 	},
 	/// The channel is open, no payment is currently being forwarded, and the JIT channel fee still
 	/// needs to be paid. This state can occur when the initial payment fails, e.g. due to a
@@ -325,20 +328,8 @@ impl OutboundJITChannelState {
 				};
 				Ok(None)
 			},
-			OutboundJITChannelState::PendingPaymentForward {
-				payment_queue,
-				opening_fee_msat,
-				channel_id,
-				collected_fee_msat,
-			} => {
-				let mut payment_queue = core::mem::take(payment_queue);
+			OutboundJITChannelState::PendingPaymentForward { payment_queue, .. } => {
 				payment_queue.add_htlc(htlc);
-				*self = OutboundJITChannelState::PendingPaymentForward {
-					payment_queue,
-					opening_fee_msat: *opening_fee_msat,
-					channel_id: *channel_id,
-					collected_fee_msat: *collected_fee_msat,
-				};
 				Ok(None)
 			},
 			OutboundJITChannelState::PendingPayment {
@@ -351,6 +342,7 @@ impl OutboundJITChannelState {
 				let required_payment_size_msat = (*payment_size_msat).unwrap_or(*opening_fee_msat);
 				if let Some(entry) = payment_queue.pop_greater_than_msat(required_payment_size_msat)
 				{
+					let fee_payment_htlcs = entry.intercept_ids();
 					let forward_payment = HTLCInterceptedAction::ForwardPayment(
 						*channel_id,
 						FeePayment { htlcs: entry.htlcs, opening_fee_msat: *opening_fee_msat },
@@ -360,6 +352,7 @@ impl OutboundJITChannelState {
 						opening_fee_msat: *opening_fee_msat,
 						channel_id: *channel_id,
 						collected_fee_msat: 0,
+						fee_payment_htlcs,
 					};
 					Ok(Some(forward_payment))
 				} else {
@@ -389,6 +382,7 @@ impl OutboundJITChannelState {
 				let required_payment_size_msat = (*payment_size_msat).unwrap_or(*opening_fee_msat);
 				if let Some(entry) = payment_queue.pop_greater_than_msat(required_payment_size_msat)
 				{
+					let fee_payment_htlcs = entry.intercept_ids();
 					let forward_payment = ForwardPaymentAction(
 						channel_id,
 						FeePayment { htlcs: entry.htlcs, opening_fee_msat: *opening_fee_msat },
@@ -398,6 +392,7 @@ impl OutboundJITChannelState {
 						opening_fee_msat: *opening_fee_msat,
 						channel_id,
 						collected_fee_msat: 0,
+						fee_payment_htlcs,
 					};
 					Ok(Some(forward_payment))
 				} else {
@@ -432,6 +427,7 @@ impl OutboundJITChannelState {
 				let required_payment_size_msat = (*payment_size_msat).unwrap_or(*opening_fee_msat);
 				if let Some(entry) = payment_queue.pop_greater_than_msat(required_payment_size_msat)
 				{
+					let fee_payment_htlcs = entry.intercept_ids();
 					let forward_payment = ForwardPaymentAction(
 						*channel_id,
 						FeePayment { htlcs: entry.htlcs, opening_fee_msat: *opening_fee_msat },
@@ -441,6 +437,7 @@ impl OutboundJITChannelState {
 						opening_fee_msat: *opening_fee_msat,
 						channel_id: *channel_id,
 						collected_fee_msat: 0,
+						fee_payment_htlcs,
 					};
 					Ok(Some(forward_payment))
 				} else {
@@ -484,6 +481,7 @@ impl OutboundJITChannelState {
 				channel_id,
 				opening_fee_msat,
 				collected_fee_msat,
+				fee_payment_htlcs,
 			} => {
 				// The fee is skimmed across all parts of the payment, each of which is reported
 				// as forwarded on its own.
@@ -499,6 +497,7 @@ impl OutboundJITChannelState {
 						opening_fee_msat: *opening_fee_msat,
 						channel_id: *channel_id,
 						collected_fee_msat,
+						fee_payment_htlcs: core::mem::take(fee_payment_htlcs),
 					};
 					Ok(None)
 				}
@@ -515,6 +514,27 @@ impl OutboundJITChannelState {
 	}
 }
 
+impl OutboundJITChannelState {
+	/// The recorded HTLCs of the fee payment in flight over `channel_id`, empty for state persisted
+	/// before they were recorded, or `None` if no fee payment is in flight over it.
+	fn fee_payment_over(&self, channel_id: ChannelId) -> Option<&[InterceptId]> {
+		match self {
+			OutboundJITChannelState::PendingPaymentForward {
+				channel_id: forwarded_over,
+				fee_payment_htlcs,
+				..
+			} if *forwarded_over == channel_id => Some(fee_payment_htlcs),
+			_ => None,
+		}
+	}
+}
+
+/// The only item of `items`, if there is exactly one.
+fn only<T>(mut items: impl Iterator<Item = T>) -> Option<T> {
+	let item = items.next()?;
+	items.next().is_none().then_some(item)
+}
+
 impl_writeable_tlv_based_enum!(OutboundJITChannelState,
 	(0, PendingInitialPayment) => {
 		(0, payment_queue, required),
@@ -529,6 +549,7 @@ impl_writeable_tlv_based_enum!(OutboundJITChannelState,
 		(2, opening_fee_msat, required),
 		(4, channel_id, required),
 		(5, collected_fee_msat, (default_value, 0)),
+		(7, fee_payment_htlcs, optional_vec),
 	},
 	(6, PendingPayment) => {
 		(0, payment_queue, required),
@@ -730,6 +751,7 @@ impl_writeable_tlv_based!(PendingSplice, {
 pub(crate) struct PeerState {
 	outbound_channels_by_intercept_scid: HashMap<u64, OutboundJITChannel>,
 	intercept_scid_by_user_channel_id: HashMap<u128, u64>,
+	/// The buy that last took each channel. A channel spliced for later buys carries those too.
 	intercept_scid_by_channel_id: HashMap<ChannelId, u64>,
 	/// Buys awaiting a splice of a channel with the client to lock, by that channel.
 	pending_splices_by_channel_id: HashMap<ChannelId, PendingSplice>,
@@ -830,6 +852,44 @@ impl PeerState {
 		let htlcs = self.reset_pending_channel_open(splice.intercept_scid);
 		debug_assert!(htlcs.is_some(), "A buy awaiting a splice awaits its channel");
 		Some(htlcs.unwrap_or_default())
+	}
+
+	/// Returns the buy whose fee payment over `channel_id` an event about `prev_htlcs` reports on.
+	///
+	/// Any number of buys can await their fee payment over one channel once it is spliced for later
+	/// buys, and other HTLCs over it are none of theirs. A buy whose HTLCs were not recorded, or an
+	/// event that names none, is matched by channel, but only while that leaves a single buy.
+	fn fee_payment_buy(
+		&mut self, channel_id: ChannelId, prev_htlcs: &[InboundHTLCLocator],
+	) -> Option<&mut OutboundJITChannel> {
+		let candidates: Vec<(u64, &[InterceptId])> = self
+			.outbound_channels_by_intercept_scid
+			.iter()
+			.filter_map(|(scid, entry)| Some((*scid, entry.state.fee_payment_over(channel_id)?)))
+			.collect();
+		if candidates.is_empty() {
+			return None;
+		}
+		let intercept_ids: Vec<InterceptId> =
+			prev_htlcs.iter().filter_map(InboundHTLCLocator::intercept_id).collect();
+		let intercept_scid = if intercept_ids.is_empty() {
+			only(candidates.iter())
+		} else {
+			candidates
+				.iter()
+				.find(|(_, recorded)| intercept_ids.iter().any(|id| recorded.contains(id)))
+				.or_else(|| only(candidates.iter().filter(|(_, recorded)| recorded.is_empty())))
+		}
+		.map(|(intercept_scid, _)| *intercept_scid)?;
+		self.outbound_channels_by_intercept_scid.get_mut(&intercept_scid)
+	}
+
+	/// Whether a buy forwards its fee payment over `channel_id` from before its HTLCs were recorded,
+	/// so that the channel's events can only be matched to it by channel.
+	fn carries_unrecorded_fee_payment(&self, channel_id: ChannelId) -> bool {
+		self.outbound_channels_by_intercept_scid
+			.values()
+			.any(|entry| entry.state.fee_payment_over(channel_id).is_some_and(<[_]>::is_empty))
 	}
 
 	/// Returns the channel the buy with `intercept_scid` awaits a splice of, if any.
@@ -1338,13 +1398,15 @@ where
 	/// Will drop any HTLC that failed from the payment it belongs to, leaving the other HTLCs of
 	/// that payment, and any other payment queued on the same intercept scid, in place.
 	///
-	/// Will attempt to forward the next payment in the queue if one is present.
-	/// Will do nothing if the intercept scid does not match any of the ones we gave out
-	/// or if the payment queue is empty
+	/// For a failed forward of a JIT channel's fee payment, named by the event's `prev_htlcs`,
+	/// will attempt to forward the next payment in the queue if one is present. Will do nothing
+	/// for any other HTLC that failed over the channel, or if the payment queue is empty. A fee
+	/// payment from before its HTLCs were recorded, or an event naming none, is matched by channel
+	/// while that leaves a single JIT channel.
 	///
 	/// [`Event::HTLCHandlingFailed`]: lightning::events::Event::HTLCHandlingFailed
 	pub async fn htlc_handling_failed(
-		&self, failure_type: HTLCHandlingFailureType,
+		&self, failure_type: HTLCHandlingFailureType, prev_htlcs: &[InboundHTLCLocator],
 	) -> Result<(), APIError> {
 		let mut should_persist = None;
 		let mut forward_result = Ok(());
@@ -1381,30 +1443,24 @@ where
 				match outer_state_lock.get(counterparty_node_id) {
 					Some(inner_state_lock) => {
 						let mut peer_state = inner_state_lock.lock().unwrap();
-						if let Some(intercept_scid) =
-							peer_state.intercept_scid_by_channel_id.get(&channel_id).copied()
+						if let Some(jit_channel) =
+							peer_state.fee_payment_buy(channel_id, prev_htlcs)
 						{
 							should_persist = Some(*counterparty_node_id);
-
-							if let Some(jit_channel) = peer_state
-								.outbound_channels_by_intercept_scid
-								.get_mut(&intercept_scid)
-							{
-								match jit_channel.htlc_handling_failed() {
-									Ok(Some(forward_payment)) => {
-										forward_result = self.forward_fee_payment(
-											counterparty_node_id,
-											jit_channel,
-											forward_payment,
-										);
-									},
-									Ok(None) => {},
-									Err(e) => {
-										forward_result = Err(APIError::APIMisuseError {
-											err: format!("Unable to fail HTLC: {}.", e.err),
-										});
-									},
-								}
+							match jit_channel.htlc_handling_failed() {
+								Ok(Some(forward_payment)) => {
+									forward_result = self.forward_fee_payment(
+										counterparty_node_id,
+										jit_channel,
+										forward_payment,
+									);
+								},
+								Ok(None) => {},
+								Err(e) => {
+									forward_result = Err(APIError::APIMisuseError {
+										err: format!("Unable to fail HTLC: {}.", e.err),
+									});
+								},
 							}
 						}
 						peer_state.needs_persist |= should_persist.is_some();
@@ -1440,13 +1496,17 @@ where
 	/// flow, once the fee has been fully paid, the channel's funding transaction will be
 	/// broadcasted.
 	///
+	/// The event's `prev_htlcs` tell the fee payment from any other payment forwarded over the
+	/// channel, which may carry several JIT channels' buys once spliced for later ones. Events and
+	/// state from before HTLCs were recorded are matched by channel alone.
+	///
 	/// Note that `next_channel_id` and `skimmed_fee_msat` are required to be provided.
 	/// Therefore, the corresponding [`Event::PaymentForwarded`] events need to be generated and
 	/// serialized by LDK versions greater or equal to 0.0.122.
 	///
 	/// [`Event::PaymentForwarded`]: lightning::events::Event::PaymentForwarded
 	pub async fn payment_forwarded(
-		&self, next_channel_id: ChannelId, skimmed_fee_msat: u64,
+		&self, next_channel_id: ChannelId, prev_htlcs: &[InboundHTLCLocator], skimmed_fee_msat: u64,
 	) -> Result<(), APIError> {
 		let mut should_persist = None;
 		if let Some(counterparty_node_id) =
@@ -1456,42 +1516,37 @@ where
 			match outer_state_lock.get(counterparty_node_id) {
 				Some(inner_state_lock) => {
 					let mut peer_state = inner_state_lock.lock().unwrap();
-					if let Some(intercept_scid) =
-						peer_state.intercept_scid_by_channel_id.get(&next_channel_id).copied()
+					if let Some(jit_channel) =
+						peer_state.fee_payment_buy(next_channel_id, prev_htlcs)
 					{
 						should_persist = Some(*counterparty_node_id);
-
-						if let Some(jit_channel) =
-							peer_state.outbound_channels_by_intercept_scid.get_mut(&intercept_scid)
-						{
-							match jit_channel.payment_forwarded(skimmed_fee_msat) {
-								Ok(Some(ForwardHTLCsAction(channel_id, htlcs))) => {
-									for htlc in htlcs {
-										self.channel_manager.get_cm().forward_intercepted_htlc(
-											htlc.intercept_id,
-											&channel_id,
-											*counterparty_node_id,
-											htlc.expected_outbound_amount_msat,
-										)?;
-									}
-								},
-								Ok(None) => {},
-								Err(e) => {
-									return Err(APIError::APIMisuseError {
-										err: format!(
-											"Forwarded payment was not applicable for JIT channel: {}",
-											e.err
-										),
-									})
-								},
-							}
-
+						match jit_channel.payment_forwarded(skimmed_fee_msat) {
+							Ok(Some(ForwardHTLCsAction(channel_id, htlcs))) => {
+								for htlc in htlcs {
+									self.channel_manager.get_cm().forward_intercepted_htlc(
+										htlc.intercept_id,
+										&channel_id,
+										*counterparty_node_id,
+										htlc.expected_outbound_amount_msat,
+									)?;
+								}
+							},
+							Ok(None) => {},
+							Err(e) => {
+								return Err(APIError::APIMisuseError {
+									err: format!(
+										"Forwarded payment was not applicable for JIT channel: {}",
+										e.err
+									),
+								})
+							},
+						}
+					}
+					// Retried on every forward over the channel, e.g. after the client reconnects.
+					for jit_channel in peer_state.outbound_channels_by_intercept_scid.values() {
+						if jit_channel.get_channel_id() == Some(next_channel_id) {
 							self.broadcast_funding_transaction_if_applies(jit_channel);
 						}
-					} else {
-						return Err(APIError::APIMisuseError {
-							err: format!("No state for for channel id: {}", next_channel_id),
-						});
 					}
 					peer_state.needs_persist |= should_persist.is_some();
 				},
@@ -1727,9 +1782,8 @@ where
 	/// Returns an error if there is no buy for `user_channel_id` awaiting its channel, if the buy
 	/// uses the client-trusts-LSP model, as LDK broadcasts a splice transaction as soon as
 	/// `tx_signatures` are exchanged, if the buy is bound to another channel, if `channel_id` is
-	/// not a ready channel with the counterparty,
-	/// or if the channel awaits a splice for another buy or carries a buy whose payment has not yet
-	/// been forwarded.
+	/// not a ready channel with the counterparty, if the channel awaits a splice for another buy, or
+	/// if it carries a fee payment in flight from before its HTLCs were recorded.
 	///
 	/// [`LSPS2ServiceEvent::OpenChannel`]: crate::lsps2::event::LSPS2ServiceEvent::OpenChannel
 	/// [`Event::ChannelReady`]: lightning::events::Event::ChannelReady
@@ -1804,20 +1858,14 @@ where
 					err: format!("Channel {} awaits a splice for another buy", channel_id),
 				});
 			}
-			let carries_unforwarded_buy = peer_state
-				.intercept_scid_by_channel_id
-				.get(channel_id)
-				.and_then(|iscid| peer_state.outbound_channels_by_intercept_scid.get(iscid))
-				.is_some_and(|entry| entry.get_channel_id().is_none());
-			if carries_unforwarded_buy {
+			if peer_state.carries_unrecorded_fee_payment(*channel_id) {
 				return Err(APIError::APIMisuseError {
 					err: format!(
-						"Channel {} carries a buy whose payment was not yet forwarded",
+						"Channel {} carries a fee payment whose HTLCs were not recorded",
 						channel_id
 					),
 				});
 			}
-
 			peer_state.pending_splices_by_channel_id.insert(
 				*channel_id,
 				PendingSplice { intercept_scid, negotiated_funding_txos: Vec::new() },
@@ -2934,9 +2982,9 @@ where
 	///
 	/// [`Event::HTLCHandlingFailed`]: lightning::events::Event::HTLCHandlingFailed
 	pub fn htlc_handling_failed(
-		&self, failure_type: HTLCHandlingFailureType,
+		&self, failure_type: HTLCHandlingFailureType, prev_htlcs: &[InboundHTLCLocator],
 	) -> Result<(), APIError> {
-		let mut fut = pin!(self.inner.htlc_handling_failed(failure_type));
+		let mut fut = pin!(self.inner.htlc_handling_failed(failure_type, prev_htlcs));
 
 		let mut waker = dummy_waker();
 		let mut ctx = task::Context::from_waker(&mut waker);
@@ -2955,9 +3003,10 @@ where
 	///
 	/// [`Event::PaymentForwarded`]: lightning::events::Event::PaymentForwarded
 	pub fn payment_forwarded(
-		&self, next_channel_id: ChannelId, skimmed_fee_msat: u64,
+		&self, next_channel_id: ChannelId, prev_htlcs: &[InboundHTLCLocator], skimmed_fee_msat: u64,
 	) -> Result<(), APIError> {
-		let mut fut = pin!(self.inner.payment_forwarded(next_channel_id, skimmed_fee_msat));
+		let mut fut =
+			pin!(self.inner.payment_forwarded(next_channel_id, prev_htlcs, skimmed_fee_msat));
 
 		let mut waker = dummy_waker();
 		let mut ctx = task::Context::from_waker(&mut waker);
@@ -3742,6 +3791,122 @@ mod tests {
 		(peer_state, channel_id, opened_intercept_scid, spliced_intercept_scid)
 	}
 
+	/// An HTLC received from the payer, as `PaymentForwarded` and `HTLCHandlingFailed` name it.
+	fn payer_htlc(htlc_id: u64) -> InboundHTLCLocator {
+		let secp = bitcoin::secp256k1::Secp256k1::new();
+		let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&[7; 32]).unwrap();
+		InboundHTLCLocator {
+			channel_id: ChannelId([1; 32]),
+			htlc_id: Some(htlc_id),
+			amount_msat: Some(100_000_000),
+			user_channel_id: Some(1),
+			node_id: Some(PublicKey::from_secret_key(&secp, &secret_key)),
+		}
+	}
+
+	fn forwarding(
+		channel_id: ChannelId, fee_payment_htlcs: Vec<InterceptId>,
+	) -> OutboundJITChannelState {
+		OutboundJITChannelState::PendingPaymentForward {
+			payment_queue: PaymentQueue::new(),
+			opening_fee_msat: 10_000_000,
+			channel_id,
+			collected_fee_msat: 0,
+			fee_payment_htlcs,
+		}
+	}
+
+	#[test]
+	fn forwarding_events_reach_the_buy_whose_fee_payment_they_name() {
+		let (mut peer_state, channel_id, opened_intercept_scid, spliced_intercept_scid) =
+			spliced_peer_state();
+		let id = |htlc_id| payer_htlc(htlc_id).intercept_id().unwrap();
+		peer_state
+			.outbound_channels_by_intercept_scid
+			.get_mut(&opened_intercept_scid)
+			.unwrap()
+			.state = forwarding(channel_id, vec![id(1), id(2)]);
+		peer_state
+			.outbound_channels_by_intercept_scid
+			.get_mut(&spliced_intercept_scid)
+			.unwrap()
+			.state = forwarding(channel_id, vec![id(3)]);
+		let buy = |peer_state: &mut PeerState, channel_id, htlc_ids: &[u64]| {
+			let prev_htlcs: Vec<_> = htlc_ids.iter().map(|htlc_id| payer_htlc(*htlc_id)).collect();
+			peer_state.fee_payment_buy(channel_id, &prev_htlcs).map(|entry| entry.user_channel_id)
+		};
+
+		// Two buys await their fee payments over the one channel.
+		assert_eq!(buy(&mut peer_state, channel_id, &[2]), Some(43));
+		assert_eq!(buy(&mut peer_state, channel_id, &[3]), Some(46));
+		// Another HTLC over the channel is neither's, nor is the buy's HTLC over another channel.
+		assert_eq!(buy(&mut peer_state, channel_id, &[4]), None);
+		assert_eq!(buy(&mut peer_state, ChannelId([9; 32]), &[3]), None);
+
+		// A buy forwarding its fee payment since before its HTLCs were recorded matches by
+		// channel, as long as it is the only such buy, and keeps the channel from new buys.
+		assert!(!peer_state.carries_unrecorded_fee_payment(channel_id));
+		peer_state
+			.outbound_channels_by_intercept_scid
+			.get_mut(&spliced_intercept_scid)
+			.unwrap()
+			.state = forwarding(channel_id, Vec::new());
+		assert!(peer_state.carries_unrecorded_fee_payment(channel_id));
+		assert_eq!(buy(&mut peer_state, channel_id, &[4]), Some(46));
+		assert_eq!(buy(&mut peer_state, channel_id, &[2]), Some(43));
+
+		// An event from before HTLCs were reported matches by channel only if that is unambiguous.
+		let legacy_htlc = InboundHTLCLocator { htlc_id: None, ..payer_htlc(1) };
+		assert!(peer_state.fee_payment_buy(channel_id, &[legacy_htlc.clone()]).is_none());
+		peer_state
+			.outbound_channels_by_intercept_scid
+			.get_mut(&opened_intercept_scid)
+			.unwrap()
+			.state = OutboundJITChannelState::PaymentForwarded { channel_id };
+		let matched = peer_state.fee_payment_buy(channel_id, &[legacy_htlc]);
+		assert_eq!(matched.map(|entry| entry.user_channel_id), Some(46));
+	}
+
+	#[test]
+	fn a_buy_records_its_fee_payment_and_older_state_reads_without_it() {
+		let (mut peer_state, channel_id, _, spliced_intercept_scid) = spliced_peer_state();
+		let entry = peer_state
+			.outbound_channels_by_intercept_scid
+			.get_mut(&spliced_intercept_scid)
+			.unwrap();
+		let mut payment_queue = PaymentQueue::new();
+		for (id, amount_msat) in [(1, 60_000_000), (2, 40_000_000)] {
+			payment_queue.add_htlc(InterceptedHTLC {
+				intercept_id: InterceptId([id; 32]),
+				expected_outbound_amount_msat: amount_msat,
+				payment_hash: PaymentHash([7; 32]),
+			});
+		}
+		entry.payment_size_msat = Some(100_000_000);
+		entry.state = OutboundJITChannelState::PendingChannelOpen {
+			payment_queue,
+			opening_fee_msat: 10_000_000,
+			amt_to_forward_msat: Some(90_000_000),
+		};
+		assert!(entry.channel_ready(channel_id).unwrap().is_some());
+		let recorded = vec![InterceptId([1; 32]), InterceptId([2; 32])];
+		assert!(matches!(
+			&entry.state,
+			OutboundJITChannelState::PendingPaymentForward { fee_payment_htlcs, .. }
+				if *fee_payment_htlcs == recorded
+		));
+
+		for fee_payment_htlcs in [recorded, Vec::new()] {
+			let state = forwarding(channel_id, fee_payment_htlcs.clone());
+			let decoded = OutboundJITChannelState::read(&mut Cursor::new(&state.encode())).unwrap();
+			assert!(matches!(
+				decoded,
+				OutboundJITChannelState::PendingPaymentForward { fee_payment_htlcs: decoded, .. }
+					if decoded == fee_payment_htlcs
+			));
+		}
+	}
+
 	#[test]
 	fn a_failed_splice_resets_its_buy_and_leaves_the_channel_to_its_buy() {
 		let (mut peer_state, channel_id, opened_intercept_scid, spliced_intercept_scid) =
@@ -4183,6 +4348,7 @@ mod tests {
 				opening_fee_msat,
 				channel_id,
 				collected_fee_msat: 0,
+				fee_payment_htlcs: Vec::new(),
 			},
 			OutboundJITChannelState::PendingPayment {
 				payment_queue: payment_queue.clone(),

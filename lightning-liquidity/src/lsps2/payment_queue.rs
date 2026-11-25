@@ -21,6 +21,12 @@ pub(crate) struct PaymentQueue {
 	payments: Vec<PaymentQueueEntry>,
 }
 
+impl PaymentQueueEntry {
+	pub(crate) fn intercept_ids(&self) -> Vec<InterceptId> {
+		self.htlcs.iter().map(|htlc| htlc.intercept_id).collect()
+	}
+}
+
 impl PaymentQueue {
 	pub(crate) fn new() -> PaymentQueue {
 		PaymentQueue { payments: Vec::new() }

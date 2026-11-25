@@ -7,7 +7,7 @@ use common::{
 	get_lsps_message, LSPSNodes, LSPSNodesWithPayer, LiquidityNode,
 };
 
-use lightning::events::{ClosureReason, Event, HTLCHandlingFailureType};
+use lightning::events::{ClosureReason, Event, HTLCHandlingFailureType, InboundHTLCLocator};
 use lightning::get_event_msg;
 use lightning::ln::channelmanager::{
 	OptionalBolt11PaymentParams, PaymentId, TrustedChannelFeatures,
@@ -526,9 +526,9 @@ fn fail_intercepted_htlc(service_node: &LiquidityNode, intercept_id: InterceptId
 	let events = service_node.inner.node.get_and_clear_pending_events();
 	assert_eq!(events.len(), 1);
 	match &events[0] {
-		Event::HTLCHandlingFailed { failure_type, .. } => {
+		Event::HTLCHandlingFailed { failure_type, prev_htlcs, .. } => {
 			let service_handler = service_node.liquidity_manager.lsps2_service_handler().unwrap();
-			service_handler.htlc_handling_failed(failure_type.clone()).unwrap();
+			service_handler.htlc_handling_failed(failure_type.clone(), prev_htlcs).unwrap();
 		},
 		other => panic!("Expected HTLCHandlingFailed, got {:?}", other),
 	}
@@ -2072,7 +2072,9 @@ fn client_trusts_lsp_end_to_end_test() {
 		} => {
 			assert_eq!(prev_htlcs[0].node_id, Some(payer_node_id));
 			assert_eq!(next_htlcs[0].node_id, Some(client_node_id));
-			service_handler.payment_forwarded(channel_id, skimmed_fee_msat.unwrap_or(0)).unwrap();
+			service_handler
+				.payment_forwarded(channel_id, prev_htlcs, skimmed_fee_msat.unwrap_or(0))
+				.unwrap();
 			Some(total_fee_earned_msat.unwrap() - skimmed_fee_msat.unwrap())
 		},
 		_ => panic!("Expected PaymentForwarded event, got: {:?}", service_events[0]),
@@ -2525,27 +2527,29 @@ fn client_trusts_lsp_fee_collected_across_payment_parts() {
 	assert_eq!(num_fulfills, 2);
 
 	// Each part is reported as forwarded on its own, carrying only its share of the fee.
-	let skims: Vec<u64> = service_node
+	let skims: Vec<(Vec<InboundHTLCLocator>, u64)> = service_node
 		.inner
 		.node
 		.get_and_clear_pending_events()
 		.into_iter()
 		.filter_map(|ev| match ev {
-			Event::PaymentForwarded { skimmed_fee_msat, .. } => Some(skimmed_fee_msat.unwrap()),
+			Event::PaymentForwarded { prev_htlcs, skimmed_fee_msat, .. } => {
+				Some((prev_htlcs, skimmed_fee_msat.unwrap()))
+			},
 			_ => None,
 		})
 		.collect();
 	assert_eq!(skims.len(), 2, "Expected one PaymentForwarded event per part");
-	assert!(skims.iter().all(|skim| *skim < fee_base_msat));
-	assert_eq!(skims.iter().sum::<u64>(), fee_base_msat);
+	assert!(skims.iter().all(|(_, skim)| *skim < fee_base_msat));
+	assert_eq!(skims.iter().map(|(_, skim)| skim).sum::<u64>(), fee_base_msat);
 
 	let was_broadcast = || {
 		let broadcasted = service_node.inner.tx_broadcaster.txn_broadcasted.lock().unwrap();
 		broadcasted.iter().any(|tx| tx.compute_txid() == funding_tx.compute_txid())
 	};
-	service_handler.payment_forwarded(channel_id, skims[0]).unwrap();
+	service_handler.payment_forwarded(channel_id, &skims[0].0, skims[0].1).unwrap();
 	assert!(!was_broadcast(), "Part of the opening fee must not count as all of it");
-	service_handler.payment_forwarded(channel_id, skims[1]).unwrap();
+	service_handler.payment_forwarded(channel_id, &skims[1].0, skims[1].1).unwrap();
 	assert!(was_broadcast(), "The opening fee was collected in full across both parts");
 
 	service_node.inner.node.get_and_clear_pending_msg_events();
@@ -2984,11 +2988,13 @@ fn late_payment_forwarded_and_safe_after_force_close_does_not_broadcast() {
 
 	// Service now has PaymentForwarded. Record in JIT state but still not safe to broadcast.
 	let events = service_node.node.get_and_clear_pending_events();
-	let skimmed = match events[0].clone() {
-		Event::PaymentForwarded { skimmed_fee_msat, .. } => skimmed_fee_msat.unwrap_or(0),
+	let (prev_htlcs, skimmed) = match events[0].clone() {
+		Event::PaymentForwarded { prev_htlcs, skimmed_fee_msat, .. } => {
+			(prev_htlcs, skimmed_fee_msat.unwrap_or(0))
+		},
 		other => panic!("Expected PaymentForwarded, got {:?}", other),
 	};
-	service_handler.payment_forwarded(channel_id, skimmed).unwrap();
+	service_handler.payment_forwarded(channel_id, &prev_htlcs, skimmed).unwrap();
 
 	// Force-close the service->client channel
 	service_node
@@ -3530,8 +3536,9 @@ fn client_trusts_lsp_partial_fee_does_not_trigger_broadcast() {
 
 	assert!(service_node.liquidity_manager.get_and_clear_pending_events().is_empty());
 
+	// Naming no HTLCs, as an event from before they were reported, it is matched by channel.
 	let partial_skim_msat = fee_base_msat - 1; // less than promised fee
-	service_handler.payment_forwarded(channel_id, partial_skim_msat).unwrap();
+	service_handler.payment_forwarded(channel_id, &[], partial_skim_msat).unwrap();
 
 	let broadcasted = service_node.inner.tx_broadcaster.txn_broadcasted.lock().unwrap();
 	assert!(broadcasted.is_empty(), "There should be no broadcasted txs yet");
@@ -3738,7 +3745,8 @@ fn splice_into_existing_channel_forwards_once_locked() {
 
 	let buy_user_channel_id = 7;
 	assert_ne!(buy_user_channel_id, channel_user_channel_id);
-	buy_until_open_channel(&lsps_nodes, promise_secret, buy_user_channel_id, "splice");
+	let (intercept_scid, _) =
+		buy_until_open_channel(&lsps_nodes, promise_secret, buy_user_channel_id, "splice");
 
 	let prior_funding_txo = service_node
 		.node
@@ -3822,7 +3830,10 @@ fn splice_into_existing_channel_forwards_once_locked() {
 
 	let client_events = client_node.inner.node.get_and_clear_pending_events();
 	assert_eq!(client_events.len(), 1);
-	assert!(matches!(client_events[0], Event::PaymentClaimable { .. }));
+	let preimage = match &client_events[0] {
+		Event::PaymentClaimable { purpose, .. } => purpose.preimage().unwrap(),
+		other => panic!("Expected PaymentClaimable, got {:?}", other),
+	};
 
 	// A replayed `ChannelReady` finds the spliced buy, which is past it, rather than rebinding the
 	// channel to the buy its `user_channel_id` names.
@@ -3832,10 +3843,51 @@ fn splice_into_existing_channel_forwards_once_locked() {
 	service_node.inner.node.process_pending_htlc_forwards();
 	assert!(service_node.inner.node.get_and_clear_pending_msg_events().is_empty());
 
-	// The client has not claimed, so the buy's payment is not yet forwarded and the channel can't
-	// take another buy.
+	// The client has not claimed, so the buy's payment is not yet forwarded, but the channel can
+	// take another buy: forwarding events are matched to a buy by HTLC, not by channel.
 	buy_until_open_channel(&lsps_nodes, promise_secret, 8, "second");
-	assert!(service_handler.splice_initiated(&client_node_id, 8, &channel_id).is_err());
+	service_handler.splice_initiated(&client_node_id, 8, &channel_id).unwrap();
+
+	// The fee payment's `PaymentForwarded` reaches the spliced buy, leaving the second bound.
+	client_node.inner.node.claim_funds(preimage);
+	claim_and_assert_forwarded_only(
+		&lsps_nodes.payer_node,
+		&service_node.inner,
+		&client_node.inner,
+		preimage,
+	);
+	let service_events = service_node.inner.node.get_and_clear_pending_events();
+	assert_eq!(service_events.len(), 1);
+	match &service_events[0] {
+		Event::PaymentForwarded { prev_htlcs, skimmed_fee_msat, .. } => service_handler
+			.payment_forwarded(channel_id, prev_htlcs, skimmed_fee_msat.unwrap())
+			.unwrap(),
+		other => panic!("Expected PaymentForwarded, got {:?}", other),
+	}
+	expect_payment_sent(&lsps_nodes.payer_node, preimage, Some(Some(0)), true, true);
+
+	// The spliced buy's fee is paid, so a next payment to it is forwarded straight away.
+	let payment_hash = PaymentHash([44; 32]);
+	let next = intercept_payer_htlc(
+		&lsps_nodes,
+		intercept_scid,
+		500_000,
+		payment_hash,
+		PaymentId([3; 32]),
+	);
+	service_handler.htlc_intercepted(intercept_scid, next, 500_000, payment_hash, 500_000).unwrap();
+	service_node.inner.node.process_pending_htlc_forwards();
+	check_added_monitors(&service_node.inner, 1);
+	let events = service_node.inner.node.get_and_clear_pending_msg_events();
+	assert_eq!(events.len(), 1);
+	assert_eq!(SendEvent::from_event(events[0].clone()).node_id, client_node_id);
+
+	// The second buy is still bound to a splice of the channel.
+	service_handler.splice_failed(&client_node_id, &channel_id).unwrap();
+	service_node.inner.node.get_and_clear_pending_events();
+	service_node.inner.node.process_pending_htlc_forwards();
+	service_node.inner.node.get_and_clear_pending_msg_events();
+	service_node.inner.chain_monitor.added_monitors.lock().unwrap().clear();
 }
 
 #[test]
@@ -3879,7 +3931,7 @@ fn splice_failed_fails_the_buy_back_so_it_can_be_paid_again() {
 }
 
 #[test]
-fn splice_initiated_refuses_a_channel_carrying_an_unforwarded_buy() {
+fn splice_initiated_refuses_a_channel_awaiting_another_splice() {
 	let chanmon_cfgs = create_chanmon_cfgs(3);
 	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
 	let mut service_node_config = test_default_channel_config();

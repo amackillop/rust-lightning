@@ -1,0 +1,11 @@
+# API Updates
+
+ * `LSPS2ServiceHandler::payment_forwarded` and `htlc_handling_failed` now take the `prev_htlcs`
+   of the event they are called for, by which they tell a JIT channel's fee payment from any
+   other HTLC over the channel. A channel can thus carry several buys awaiting their fee
+   payments, and `splice_initiated` no longer refuses one that does.
+
+# Backwards Compatibility
+
+ * State persisted before the fee payment's HTLCs were recorded, and events that do not name
+   them, are matched by channel alone, as before.
