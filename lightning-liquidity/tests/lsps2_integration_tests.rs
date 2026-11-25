@@ -3890,6 +3890,106 @@ fn splice_into_existing_channel_forwards_once_locked() {
 	service_node.inner.chain_monitor.added_monitors.lock().unwrap().clear();
 }
 
+/// A buy whose payment failed back before its splice locked keeps the channel's new liquidity and
+/// awaits a next payment over it, as over a channel opened for it, rather than costing a second
+/// splice once its payer pays again.
+#[test]
+fn a_splice_locking_after_its_payment_failed_back_awaits_the_next_one() {
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let mut service_node_config = test_default_channel_config();
+	service_node_config.htlc_interception_flags = HTLCInterceptionFlags::ToInterceptSCIDs as u8;
+	let node_chanmgrs =
+		create_node_chanmgrs(3, &node_cfgs, &[Some(service_node_config), None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+	let (lsps_nodes, promise_secret, channel_id, channel_user_channel_id) =
+		setup_spliceable_lsps2_nodes(nodes);
+	let LSPSNodesWithPayer { ref service_node, ref client_node, ref payer_node } = lsps_nodes;
+	let payer_node_id = payer_node.node.get_our_node_id();
+	let service_node_id = service_node.inner.node.get_our_node_id();
+	let client_node_id = client_node.inner.node.get_our_node_id();
+	let service_handler = service_node.liquidity_manager.lsps2_service_handler().unwrap();
+
+	let buy_user_channel_id = 7;
+	let (intercept_scid, intercept_id) =
+		buy_until_open_channel(&lsps_nodes, promise_secret, buy_user_channel_id, "lost");
+	service_handler.splice_initiated(&client_node_id, buy_user_channel_id, &channel_id).unwrap();
+
+	// The payment is failed back while the splice is in flight.
+	fail_intercepted_htlc(service_node, intercept_id);
+	service_node.inner.node.process_pending_htlc_forwards();
+	let update_fail = get_htlc_update_msgs(&service_node.inner, &payer_node_id);
+	check_added_monitors(&service_node.inner, 1);
+	payer_node.node.handle_update_fail_htlc(service_node_id, &update_fail.update_fail_htlcs[0]);
+	do_commitment_signed_dance(
+		&payer_node,
+		&service_node.inner,
+		&update_fail.commitment_signed,
+		false,
+		false,
+	);
+	payer_node.node.get_and_clear_pending_events();
+
+	provide_utxo_reserves(core::slice::from_ref(&service_node.inner), 1, Amount::ONE_BTC);
+	connect_blocks(&client_node.inner, 1);
+	connect_blocks(&payer_node, 1);
+	let contribution = do_initiate_splice_in(
+		&service_node.inner,
+		&client_node.inner,
+		channel_id,
+		Amount::from_sat(100_000),
+	);
+	let (splice_tx, new_funding_script) =
+		splice_channel(&service_node.inner, &client_node.inner, channel_id, contribution);
+	let new_funding_txo = OutPoint {
+		txid: splice_tx.compute_txid(),
+		index: splice_tx
+			.output
+			.iter()
+			.position(|output| output.script_pubkey == new_funding_script)
+			.unwrap() as u16,
+	};
+	service_handler.splice_negotiated(&client_node_id, &channel_id, new_funding_txo).unwrap();
+	mine_transaction(&service_node.inner, &splice_tx);
+	mine_transaction(&client_node.inner, &splice_tx);
+	lock_splice_after_blocks(&service_node.inner, &client_node.inner, ANTI_REORG_DELAY - 1);
+
+	// The buy takes the channel with nothing to forward.
+	service_handler
+		.channel_ready(channel_user_channel_id, &channel_id, &client_node_id, Some(new_funding_txo))
+		.unwrap();
+	service_node.inner.node.process_pending_htlc_forwards();
+	assert!(service_node.inner.node.get_and_clear_pending_msg_events().is_empty());
+
+	// The payer's next payment is forwarded over the channel as the buy's fee payment.
+	let payment_hash = PaymentHash([43; 32]);
+	let retry = intercept_payer_htlc(
+		&lsps_nodes,
+		intercept_scid,
+		1_000_000,
+		payment_hash,
+		PaymentId([2; 32]),
+	);
+	service_handler
+		.htlc_intercepted(intercept_scid, retry, 1_000_000, payment_hash, 1_000_000)
+		.unwrap();
+	assert!(service_node.liquidity_manager.next_event().is_none());
+	service_node.inner.node.process_pending_htlc_forwards();
+	check_added_monitors(&service_node.inner, 1);
+	let mut events = service_node.inner.node.get_and_clear_pending_msg_events();
+	assert_eq!(events.len(), 1);
+	let forward = SendEvent::from_event(events.remove(0));
+	assert_eq!(forward.node_id, client_node_id);
+	assert_eq!(forward.msgs[0].channel_id, channel_id);
+	assert_eq!(forward.msgs[0].amount_msat, 1_000_000 - 1_000);
+	// The client is never asked to take the forward.
+	client_node.inner.node.get_and_clear_pending_msg_events();
+
+	// The splice no longer holds the channel, so it can be spliced for a next buy.
+	buy_until_open_channel(&lsps_nodes, promise_secret, 8, "next");
+	service_handler.splice_initiated(&client_node_id, 8, &channel_id).unwrap();
+}
+
 #[test]
 fn splice_failed_fails_the_buy_back_so_it_can_be_paid_again() {
 	let chanmon_cfgs = create_chanmon_cfgs(3);

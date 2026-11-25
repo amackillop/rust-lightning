@@ -2073,8 +2073,10 @@ where
 	/// we need to forward a payment over otherwise it will be ignored.
 	///
 	/// A buy bound through [`Self::splice_initiated`] is served once `funding_txo` is a splice
-	/// reported through [`Self::splice_negotiated`]. Otherwise the buy is found by `channel_id`
-	/// when the channel has one, as for a replayed event, and by `user_channel_id` if not.
+	/// reported through [`Self::splice_negotiated`]. A buy whose payment is gone by then takes the
+	/// channel all the same and awaits a next payment over it, as over a channel opened for it.
+	/// Otherwise the buy is found by `channel_id` when the channel has one, as for a replayed
+	/// event, and by `user_channel_id` if not.
 	///
 	/// [`Event::ChannelReady`]: lightning::events::Event::ChannelReady
 	pub async fn channel_ready(
@@ -2114,7 +2116,7 @@ where
 						.map(|jit_channel| jit_channel.channel_ready(*channel_id));
 					if let Some(transition) = transition {
 						match transition {
-							Ok(Some(forward_payment)) => {
+							Ok(forward_payment) => {
 								if spliced_intercept_scid.is_some() {
 									peer_state.pending_splices_by_channel_id.remove(channel_id);
 									peer_state
@@ -2123,9 +2125,11 @@ where
 									peer_state.needs_persist = true;
 									should_persist = true;
 								}
-								if let Some(jit_channel) = peer_state
+								let jit_channel = peer_state
 									.outbound_channels_by_intercept_scid
-									.get_mut(&intercept_scid)
+									.get_mut(&intercept_scid);
+								if let (Some(forward_payment), Some(jit_channel)) =
+									(forward_payment, jit_channel)
 								{
 									forward_result = self.forward_fee_payment(
 										counterparty_node_id,
@@ -2134,7 +2138,6 @@ where
 									);
 								}
 							},
-							Ok(None) => {},
 							Err(e) => {
 								return Err(APIError::APIMisuseError {
 									err: format!(
