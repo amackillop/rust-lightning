@@ -5987,7 +5987,6 @@ fn do_test_splice_with_inflight_htlc_forward_and_resolution(expire_scid_pre_forw
 		// forwarding for `CHANNEL_ANNOUNCEMENT_PROPAGATION_DELAY` blocks is kinda nuts.
 		let fail_type = HTLCHandlingFailureType::InvalidForward {
 			requested_forward_scid: chan_upd_1_2.contents.short_channel_id,
-			intercept_id: None,
 		};
 		expect_htlc_forwarding_fails(&nodes[1], &[fail_type]);
 		check_added_monitors(&nodes[1], 1);

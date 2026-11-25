@@ -254,13 +254,11 @@ fn do_test_htlc_interception_flags(
 				} else if flag == Flag::ToInterceptSCIDs {
 					expected_failure_type = HTLCHandlingFailureType::InvalidForward {
 						requested_forward_scid: target_scid,
-						intercept_id: None,
 					};
 					reason = reason_from_mod.unwrap_or(LocalHTLCFailureReason::UnknownNextPeer);
 				} else if flag == Flag::ToUnknownSCIDs {
 					expected_failure_type = HTLCHandlingFailureType::InvalidForward {
 						requested_forward_scid: target_scid,
-						intercept_id: None,
 					};
 					reason = reason_from_mod.unwrap_or(LocalHTLCFailureReason::UnknownNextPeer);
 				} else {

@@ -1024,10 +1024,7 @@ fn test_onion_failure() {
 		Some(LocalHTLCFailureReason::UnknownNextPeer),
 		Some(NetworkUpdate::ChannelFailure { short_channel_id, is_permanent: true }),
 		Some(short_channel_id),
-		Some(HTLCHandlingFailureType::InvalidForward {
-			requested_forward_scid: short_channel_id,
-			intercept_id: None,
-		}),
+		Some(HTLCHandlingFailureType::InvalidForward { requested_forward_scid: short_channel_id }),
 	);
 
 	let short_channel_id = channels[1].0.contents.short_channel_id;
@@ -2742,10 +2739,7 @@ fn test_phantom_failure_modified_cltv() {
 	expect_and_process_pending_htlcs(&nodes[1], false);
 	expect_htlc_handling_failed_destinations!(
 		nodes[1].node.get_and_clear_pending_events(),
-		&[HTLCHandlingFailureType::InvalidForward {
-			requested_forward_scid: phantom_scid,
-			intercept_id: None,
-		}]
+		&[HTLCHandlingFailureType::InvalidForward { requested_forward_scid: phantom_scid }]
 	);
 	check_added_monitors(&nodes[1], 1);
 
@@ -2798,10 +2792,7 @@ fn test_phantom_failure_expires_too_soon() {
 	expect_and_process_pending_htlcs(&nodes[1], false);
 	expect_htlc_handling_failed_destinations!(
 		nodes[1].node.get_and_clear_pending_events(),
-		&[HTLCHandlingFailureType::InvalidForward {
-			requested_forward_scid: phantom_scid,
-			intercept_id: None,
-		}]
+		&[HTLCHandlingFailureType::InvalidForward { requested_forward_scid: phantom_scid }]
 	);
 	check_added_monitors(&nodes[1], 1);
 
@@ -2921,10 +2912,7 @@ fn do_test_phantom_dust_exposure_failure(multiplier_dust_limit: bool) {
 	expect_and_process_pending_htlcs(&nodes[1], false);
 	expect_htlc_handling_failed_destinations!(
 		nodes[1].node.get_and_clear_pending_events(),
-		&[HTLCHandlingFailureType::InvalidForward {
-			requested_forward_scid: phantom_scid,
-			intercept_id: None,
-		}]
+		&[HTLCHandlingFailureType::InvalidForward { requested_forward_scid: phantom_scid }]
 	);
 	check_added_monitors(&nodes[1], 1);
 

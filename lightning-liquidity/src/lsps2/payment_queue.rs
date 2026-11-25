@@ -59,34 +59,11 @@ impl PaymentQueue {
 	}
 
 	pub(crate) fn pop_greater_than_msat(&mut self, amount_msat: u64) -> Option<PaymentQueueEntry> {
-		let position = self.position_greater_than_msat(amount_msat);
-		position.map(|position| self.payments.remove(position))
-	}
-
-	/// Whether [`Self::pop_greater_than_msat`] would pop a payment.
-	pub(crate) fn has_greater_than_msat(&self, amount_msat: u64) -> bool {
-		self.position_greater_than_msat(amount_msat).is_some()
-	}
-
-	fn position_greater_than_msat(&self, amount_msat: u64) -> Option<usize> {
-		self.payments.iter().position(|entry| Self::payment_status(entry).0 >= amount_msat)
-	}
-
-	/// Removes the HTLC held under `intercept_id`, returning whether it was queued.
-	pub(crate) fn remove_htlc(&mut self, intercept_id: InterceptId) -> bool {
-		let found = self.payments.iter().enumerate().find_map(|(position, entry)| {
-			let index = entry.htlcs.iter().position(|htlc| htlc.intercept_id == intercept_id)?;
-			Some((position, index))
+		let position = self.payments.iter().position(|entry| {
+			entry.htlcs.iter().map(|htlc| htlc.expected_outbound_amount_msat).sum::<u64>()
+				>= amount_msat
 		});
-		let Some((position, index)) = found else {
-			return false;
-		};
-		let entry = &mut self.payments[position];
-		entry.htlcs.remove(index);
-		if entry.htlcs.is_empty() {
-			self.payments.remove(position);
-		}
-		true
+		position.map(|position| self.payments.remove(position))
 	}
 
 	/// The total expected outbound amount of the first queued payment.
