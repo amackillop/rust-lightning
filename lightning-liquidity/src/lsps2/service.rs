@@ -567,15 +567,14 @@ impl OutboundJITChannel {
 		else {
 			return None;
 		};
-		// Recomputed as on interception, from the payment that triggered the open, for state that
+		// Listed only while its channel, once ready, would find a payment to forward.
+		let required_payment_size_msat = self.payment_size_msat.unwrap_or(*opening_fee_msat);
+		let forwardable_msat = payment_queue.peek_greater_than_msat(required_payment_size_msat)?;
+		// Recomputed as on interception, from the payment that would be forwarded, for state that
 		// did not record it.
-		let amt_to_forward_msat = amt_to_forward_msat.or_else(|| {
-			let payment_size_msat =
-				self.payment_size_msat.or_else(|| payment_queue.first_payment_msat())?;
-			Some(payment_size_msat.saturating_sub(*opening_fee_msat))
+		let amt_to_forward_msat = amt_to_forward_msat.unwrap_or_else(|| {
+			self.payment_size_msat.unwrap_or(forwardable_msat).saturating_sub(*opening_fee_msat)
 		});
-		debug_assert!(amt_to_forward_msat.is_some(), "A buy awaiting its channel holds a payment");
-		let amt_to_forward_msat = amt_to_forward_msat?;
 		Some(BuyAwaitingChannel {
 			user_channel_id: self.user_channel_id,
 			intercept_scid,
@@ -696,7 +695,8 @@ impl OutboundJITChannel {
 }
 
 /// A buy whose [`LSPS2ServiceEvent::OpenChannel`] event was emitted but which neither has a channel
-/// nor is bound to a splice, as returned by [`LSPS2ServiceHandler::buys_awaiting_channel`].
+/// nor is bound to a splice, and which holds a payment to forward once it has, as returned by
+/// [`LSPS2ServiceHandler::buys_awaiting_channel`].
 ///
 /// [`LSPS2ServiceEvent::OpenChannel`]: crate::lsps2::event::LSPS2ServiceEvent::OpenChannel
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1836,7 +1836,13 @@ where
 	}
 
 	/// Returns the buys of `counterparty_node_id` whose [`LSPS2ServiceEvent::OpenChannel`] event
-	/// was emitted but which neither have a channel nor are bound to a splice.
+	/// was emitted but which neither have a channel nor are bound to a splice, and which hold a
+	/// payment to forward once they have: a whole one if the buy set `payment_size_msat`, one
+	/// covering the opening fee if not.
+	///
+	/// A buy drops a held HTLC once [`Self::htlc_handling_failed`] reports it failed back, e.g., as
+	/// it neared its expiry, and is listed again once such a payment arrives, a retry or any other
+	/// payment to its intercept SCID.
 	///
 	/// [`LSPS2ServiceEvent::OpenChannel`] events are not replayed once handled, so use this to
 	/// resume buys you deferred, e.g., to wait for an existing channel with the client to become
@@ -3837,15 +3843,80 @@ mod tests {
 			.outbound_channels_by_intercept_scid
 			.get_mut(&spliced_intercept_scid)
 			.unwrap();
+		let mut payment_queue = PaymentQueue::new();
+		payment_queue.add_htlc(InterceptedHTLC {
+			intercept_id: InterceptId([1; 32]),
+			expected_outbound_amount_msat: 100_000_000,
+			payment_hash: PaymentHash([1; 32]),
+		});
 		entry.payment_size_msat = Some(100_000_000);
 		entry.state = OutboundJITChannelState::PendingChannelOpen {
-			payment_queue: PaymentQueue::new(),
+			payment_queue,
 			opening_fee_msat: 10_000_000,
 			amt_to_forward_msat: None,
 		};
 		let awaiting = entry.awaiting_channel(spliced_intercept_scid).unwrap();
 		assert_eq!(awaiting.amt_to_forward_msat, 90_000_000);
 		assert_eq!(awaiting.opening_fee_msat, 10_000_000);
+	}
+
+	#[test]
+	fn a_buy_awaits_its_channel_only_while_it_holds_its_whole_payment() {
+		let (mut peer_state, _, _, intercept_scid) = spliced_peer_state();
+		let entry =
+			peer_state.outbound_channels_by_intercept_scid.get_mut(&intercept_scid).unwrap();
+		let part = |id: u8, amount_msat| InterceptedHTLC {
+			intercept_id: InterceptId([id; 32]),
+			expected_outbound_amount_msat: amount_msat,
+			payment_hash: PaymentHash([7; 32]),
+		};
+		let mut payment_queue = PaymentQueue::new();
+		payment_queue.add_htlc(part(1, 60_000_000));
+		payment_queue.add_htlc(part(2, 40_000_000));
+		entry.payment_size_msat = Some(100_000_000);
+		entry.state = OutboundJITChannelState::PendingChannelOpen {
+			payment_queue,
+			opening_fee_msat: 10_000_000,
+			amt_to_forward_msat: Some(90_000_000),
+		};
+		assert!(entry.awaiting_channel(intercept_scid).is_some());
+
+		// LDK failed a part back as it neared its expiry.
+		assert!(entry.retain_htlcs(|htlc| htlc.intercept_id != InterceptId([2; 32])));
+		assert_eq!(entry.awaiting_channel(intercept_scid), None);
+
+		// The payer's retry of the part makes the payment whole again.
+		assert!(entry.htlc_intercepted(part(3, 40_000_000)).unwrap().is_none());
+		assert!(entry.awaiting_channel(intercept_scid).is_some());
+	}
+
+	#[test]
+	fn a_variable_amount_buy_awaits_its_channel_with_any_payment_covering_its_fee() {
+		let (mut peer_state, _, _, intercept_scid) = spliced_peer_state();
+		let entry =
+			peer_state.outbound_channels_by_intercept_scid.get_mut(&intercept_scid).unwrap();
+		let htlc = |id: u8, amount_msat| InterceptedHTLC {
+			intercept_id: InterceptId([id; 32]),
+			expected_outbound_amount_msat: amount_msat,
+			payment_hash: PaymentHash([id; 32]),
+		};
+		entry.payment_size_msat = None;
+		for amt_to_forward_msat in [Some(90_000_000), None] {
+			let mut payment_queue = PaymentQueue::new();
+			payment_queue.add_htlc(htlc(1, 9_000_000));
+			entry.state = OutboundJITChannelState::PendingChannelOpen {
+				payment_queue,
+				opening_fee_msat: 10_000_000,
+				amt_to_forward_msat,
+			};
+			// Below the fee, so channel_ready would have nothing to forward.
+			assert_eq!(entry.awaiting_channel(intercept_scid), None);
+
+			// A smaller retry than the payment the buy was opened for still pays the fee.
+			assert!(entry.htlc_intercepted(htlc(2, 80_000_000)).unwrap().is_none());
+			let awaiting = entry.awaiting_channel(intercept_scid).unwrap();
+			assert_eq!(awaiting.amt_to_forward_msat, amt_to_forward_msat.unwrap_or(70_000_000));
+		}
 	}
 
 	#[test]

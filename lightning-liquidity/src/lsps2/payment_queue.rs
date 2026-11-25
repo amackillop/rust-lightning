@@ -59,16 +59,18 @@ impl PaymentQueue {
 	}
 
 	pub(crate) fn pop_greater_than_msat(&mut self, amount_msat: u64) -> Option<PaymentQueueEntry> {
-		let position = self.payments.iter().position(|entry| {
-			entry.htlcs.iter().map(|htlc| htlc.expected_outbound_amount_msat).sum::<u64>()
-				>= amount_msat
-		});
+		let position = self.position_greater_than_msat(amount_msat);
 		position.map(|position| self.payments.remove(position))
 	}
 
-	/// The total expected outbound amount of the first queued payment.
-	pub(crate) fn first_payment_msat(&self) -> Option<u64> {
-		self.payments.first().map(|entry| Self::payment_status(entry).0)
+	/// The total expected outbound amount of the payment [`Self::pop_greater_than_msat`] would pop.
+	pub(crate) fn peek_greater_than_msat(&self, amount_msat: u64) -> Option<u64> {
+		let position = self.position_greater_than_msat(amount_msat)?;
+		Some(Self::payment_status(&self.payments[position]).0)
+	}
+
+	fn position_greater_than_msat(&self, amount_msat: u64) -> Option<usize> {
+		self.payments.iter().position(|entry| Self::payment_status(entry).0 >= amount_msat)
 	}
 
 	pub(crate) fn clear(&mut self) -> Vec<InterceptedHTLC> {
