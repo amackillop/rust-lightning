@@ -163,6 +163,7 @@ fn do_test_htlc_interception_flags(
 		None => {},
 	}
 
+	let inbound_amount_msat = route.get_total_amount() + route.get_total_fees();
 	let onion = RecipientOnionFields::secret_only(payment_secret, amt_msat);
 	let payment_id = PaymentId(payment_hash.0);
 	nodes[0].node.send_payment_with_route(route, payment_hash, onion, payment_id).unwrap();
@@ -269,9 +270,21 @@ fn do_test_htlc_interception_flags(
 					reason = reason_from_mod
 						.expect("We should only fail because of a mod or unknown next-hop");
 				}
-				if let Event::HTLCHandlingFailed { failure_reason, failure_type, .. } = &events[0] {
+				if let Event::HTLCHandlingFailed {
+					failure_reason, failure_type, prev_htlcs, ..
+				} = &events[0]
+				{
 					assert_eq!(*failure_reason, Some(HTLCHandlingFailureReason::Local { reason }));
 					assert_eq!(*failure_type, expected_failure_type);
+					// It names the HTLC that came in from node 0, the first on that channel.
+					assert_eq!(prev_htlcs.len(), 1);
+					assert_eq!(
+						prev_htlcs[0].channel_id,
+						nodes[0].node.list_channels()[0].channel_id
+					);
+					assert_eq!(prev_htlcs[0].htlc_id, Some(0));
+					assert_eq!(prev_htlcs[0].node_id, Some(node_0_id));
+					assert_eq!(prev_htlcs[0].amount_msat, Some(inbound_amount_msat));
 				} else {
 					panic!("{events:?}");
 				}

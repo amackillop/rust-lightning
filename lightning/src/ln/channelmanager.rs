@@ -679,7 +679,7 @@ impl Readable for PaymentId {
 pub struct InterceptId(pub [u8; 32]);
 
 impl InterceptId {
-	fn from_htlc_id_and_chan_id(
+	pub(crate) fn from_htlc_id_and_chan_id(
 		htlc_id: u64, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
 	) -> Self {
 		let mut sha = Sha256::engine();
@@ -7621,6 +7621,13 @@ impl<
 			let mut htlc_forwards = Vec::new();
 			let mut htlc_fails = Vec::new();
 			for update_add_htlc in &update_add_htlcs {
+				let prev_htlc = || events::InboundHTLCLocator {
+					channel_id: incoming_channel_id,
+					htlc_id: Some(update_add_htlc.htlc_id),
+					amount_msat: Some(update_add_htlc.amount_msat),
+					user_channel_id: Some(incoming_user_channel_id),
+					node_id: Some(incoming_counterparty_node_id),
+				};
 				let (next_hop, next_packet_details_opt) =
 					match decode_incoming_update_add_htlc_onion(
 						&update_add_htlc,
@@ -7661,7 +7668,7 @@ impl<
 
 						Err((htlc_fail, reason)) => {
 							let failure_type = HTLCHandlingFailureType::InvalidOnion;
-							htlc_fails.push((htlc_fail, failure_type, reason.into()));
+							htlc_fails.push((htlc_fail, failure_type, reason.into(), prev_htlc()));
 							continue;
 						},
 					};
@@ -7692,7 +7699,7 @@ impl<
 						);
 						let failure_type =
 							get_htlc_failure_type(outgoing_scid_opt, update_add_htlc.payment_hash);
-						htlc_fails.push((htlc_fail, failure_type, $reason.into()));
+						htlc_fails.push((htlc_fail, failure_type, $reason.into(), prev_htlc()));
 						continue;
 					}};
 				}
@@ -7854,7 +7861,7 @@ impl<
 							shared_secret,
 							inbound_err,
 						);
-						htlc_fails.push((htlc_fail, failure_type, htlc_failure));
+						htlc_fails.push((htlc_fail, failure_type, htlc_failure, prev_htlc()));
 					},
 				}
 			}
@@ -7862,7 +7869,7 @@ impl<
 			// Process all of the forwards and failures for the channel in which the HTLCs were
 			// proposed to as a batch.
 			self.forward_htlcs(htlc_forwards);
-			for (htlc_fail, failure_type, failure_reason) in htlc_fails.drain(..) {
+			for (htlc_fail, failure_type, failure_reason, prev_htlc) in htlc_fails.drain(..) {
 				let failure = match htlc_fail {
 					HTLCFailureMsg::Relay(fail_htlc) => HTLCForwardInfo::FailHTLC {
 						htlc_id: fail_htlc.htlc_id,
@@ -7885,6 +7892,7 @@ impl<
 				self.pending_events.lock().unwrap().push_back((
 					events::Event::HTLCHandlingFailed {
 						prev_channel_ids: vec![incoming_channel_id],
+						prev_htlcs: vec![prev_htlc],
 						failure_type,
 						failure_reason: Some(failure_reason),
 					},
@@ -9569,17 +9577,19 @@ impl<
 					}
 				}
 			},
-			HTLCSource::PreviousHopData(HTLCPreviousHopData {
-				ref prev_outbound_scid_alias,
-				ref htlc_id,
-				ref incoming_packet_shared_secret,
-				ref phantom_shared_secret,
-				ref trampoline_shared_secret,
-				outpoint: _,
-				ref blinded_failure,
-				ref channel_id,
-				..
-			}) => {
+			HTLCSource::PreviousHopData(
+				ref prev_hop @ HTLCPreviousHopData {
+					ref prev_outbound_scid_alias,
+					ref htlc_id,
+					ref incoming_packet_shared_secret,
+					ref phantom_shared_secret,
+					ref trampoline_shared_secret,
+					outpoint: _,
+					ref blinded_failure,
+					ref channel_id,
+					..
+				},
+			) => {
 				log_trace!(
 					WithContext::from(&self.logger, None, Some(*channel_id), Some(*payment_hash)),
 					"Failing {}HTLC backwards from us: {:?}",
@@ -9603,6 +9613,7 @@ impl<
 				pending_events.push_back((
 					events::Event::HTLCHandlingFailed {
 						prev_channel_ids: vec![*channel_id],
+						prev_htlcs: vec![prev_hop.htlc_locator(prev_hop.amount_msat)],
 						failure_type,
 						failure_reason: Some(onion_error.into()),
 					},
@@ -9670,6 +9681,10 @@ impl<
 						prev_channel_ids: previous_hop_data
 							.iter()
 							.map(|prev| prev.channel_id)
+							.collect(),
+						prev_htlcs: previous_hop_data
+							.iter()
+							.map(|prev| prev.htlc_locator(prev.amount_msat))
 							.collect(),
 						failure_type,
 						failure_reason: Some(onion_error.into()),

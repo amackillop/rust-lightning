@@ -969,6 +969,16 @@ pub struct InboundHTLCLocator {
 	pub node_id: Option<PublicKey>,
 }
 
+impl InboundHTLCLocator {
+	/// The [`InterceptId`] that [`Event::HTLCIntercepted`] names this HTLC by when it is
+	/// intercepted, or `None` if [`Self::htlc_id`] or [`Self::node_id`] is not known.
+	pub fn intercept_id(&self) -> Option<InterceptId> {
+		let htlc_id = self.htlc_id?;
+		let node_id = self.node_id?;
+		Some(InterceptId::from_htlc_id_and_chan_id(htlc_id, &self.channel_id, &node_id))
+	}
+}
+
 impl_writeable_tlv_based!(InboundHTLCLocator, {
 	(1, channel_id, required),
 	(3, user_channel_id, option),
@@ -1945,6 +1955,10 @@ pub enum Event {
 		/// The channel(s) over which the HTLC(s) was received. May contain multiple entries for
 		/// trampoline forwards.
 		prev_channel_ids: Vec<ChannelId>,
+		/// The HTLC(s) that were failed back. May contain multiple entries for trampoline forwards.
+		///
+		/// This is empty for events serialized by versions that did not write it.
+		prev_htlcs: Vec<InboundHTLCLocator>,
 		/// The type of HTLC handling that failed.
 		failure_type: HTLCHandlingFailureType,
 		/// The reason that the HTLC failed.
@@ -2543,6 +2557,7 @@ impl Writeable for Event {
 			},
 			&Event::HTLCHandlingFailed {
 				ref prev_channel_ids,
+				ref prev_htlcs,
 				ref failure_type,
 				ref failure_reason,
 			} => {
@@ -2560,6 +2575,7 @@ impl Writeable for Event {
 					(1, failure_reason, option),
 					(2, failure_type, required),
 					(3, *prev_channel_ids, required),
+					(5, *prev_htlcs, optional_vec),
 				})
 			},
 			&Event::BumpTransaction(ref event) => {
@@ -3166,6 +3182,7 @@ impl MaybeReadable for Event {
 					let mut failure_reason = None;
 					let mut failure_type_opt = UpgradableRequired(None);
 					let mut prev_channel_ids = vec![];
+					let mut prev_htlcs = None;
 					read_tlv_fields!(reader, {
 						(0, prev_channel_id_legacy, required),
 						(1, failure_reason, option),
@@ -3173,6 +3190,7 @@ impl MaybeReadable for Event {
 						(3, prev_channel_ids, (default_value, vec![
 							prev_channel_id_legacy,
 						])),
+						(5, prev_htlcs, optional_vec),
 					});
 
 					// If a legacy HTLCHandlingFailureType::UnknownNextHop was written, upgrade
@@ -3188,6 +3206,7 @@ impl MaybeReadable for Event {
 					}
 					Ok(Some(Event::HTLCHandlingFailed {
 						prev_channel_ids,
+						prev_htlcs: prev_htlcs.unwrap_or_default(),
 						failure_type: _init_tlv_based_struct_field!(
 							failure_type_opt,
 							upgradable_required
@@ -3435,6 +3454,40 @@ impl MaybeReadable for Event {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use bitcoin::secp256k1::{Secp256k1, SecretKey};
+
+	#[test]
+	fn htlc_handling_failed_round_trips_its_htlcs() {
+		let channel_id = ChannelId::from_bytes([1; 32]);
+		let node_id = PublicKey::from_secret_key(
+			&Secp256k1::new(),
+			&SecretKey::from_slice(&[42; 32]).unwrap(),
+		);
+		let prev_htlc = InboundHTLCLocator {
+			channel_id,
+			htlc_id: Some(7),
+			amount_msat: Some(100_000),
+			user_channel_id: Some(42),
+			node_id: Some(node_id),
+		};
+		assert_eq!(
+			prev_htlc.intercept_id(),
+			Some(InterceptId::from_htlc_id_and_chan_id(7, &channel_id, &node_id))
+		);
+		// Empty, as for an event written before the field existed.
+		for prev_htlcs in [vec![prev_htlc], Vec::new()] {
+			let event = Event::HTLCHandlingFailed {
+				prev_channel_ids: vec![channel_id],
+				prev_htlcs,
+				failure_type: HTLCHandlingFailureType::InvalidForward {
+					requested_forward_scid: 42,
+				},
+				failure_reason: Some(LocalHTLCFailureReason::ForwardExpiryBuffer.into()),
+			};
+			let decoded = Event::read(&mut &event.encode()[..]).unwrap().unwrap();
+			assert_eq!(decoded, event);
+		}
+	}
 
 	#[test]
 	fn legacy_payment_forwarded_preserves_unknown_inbound_htlc_amount() {

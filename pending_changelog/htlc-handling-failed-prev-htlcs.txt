@@ -1,0 +1,14 @@
+# API Updates
+
+ * `Event::HTLCHandlingFailed` now includes `prev_htlcs`, an `InboundHTLCLocator` for each HTLC
+   that was failed back, as `Event::PaymentForwarded` does for a forwarded payment. Code that
+   constructs or destructures the variant without `..` must name the field.
+ * `InboundHTLCLocator::intercept_id` returns the `InterceptId` that `Event::HTLCIntercepted`
+   names the HTLC by when it is intercepted. This lets a handler holding intercepted HTLCs, or
+   having forwarded them, match a later `PaymentForwarded` or `HTLCHandlingFailed` to exactly
+   those HTLCs.
+
+# Backwards Compatibility
+
+ * An `Event::HTLCHandlingFailed` persisted by an earlier version reads back with empty
+   `prev_htlcs`, and an earlier version reading one written now drops them.

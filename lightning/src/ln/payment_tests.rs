@@ -25,7 +25,7 @@ use crate::ln::channel::{
 	EXPIRE_PREV_CONFIG_TICKS,
 };
 use crate::ln::channelmanager::{
-	Bolt11InvoiceParameters, HTLCForwardInfo, OptionalBolt11PaymentParams, PaymentId,
+	Bolt11InvoiceParameters, HTLCForwardInfo, InterceptId, OptionalBolt11PaymentParams, PaymentId,
 	PendingAddHTLCInfo, PendingHTLCRouting, RecentPaymentDetails, BREAKDOWN_TIMEOUT,
 	MIN_CLTV_EXPIRY_DELTA, MPP_TIMEOUT_TICKS,
 };
@@ -2275,7 +2275,20 @@ fn abandoned_payment_fulfilled_preserves_fee_paid_msat() {
 enum InterceptTest {
 	Forward,
 	Fail,
+	FailDownstream,
 	Timeout,
+}
+
+/// Asserts that `events` is one `HTLCHandlingFailed` naming the HTLC intercepted as `intercept_id`.
+fn assert_names_failed_htlc(events: &[Event], intercept_id: InterceptId) {
+	assert_eq!(events.len(), 1, "{:?}", events);
+	match &events[0] {
+		Event::HTLCHandlingFailed { prev_htlcs, .. } => {
+			assert_eq!(prev_htlcs.len(), 1);
+			assert_eq!(prev_htlcs[0].intercept_id(), Some(intercept_id));
+		},
+		other => panic!("Expected HTLCHandlingFailed, got {:?}", other),
+	}
 }
 
 #[test]
@@ -2481,6 +2494,8 @@ fn intercepted_payment() {
 	// payment or (b) fail the payment.
 	do_test_intercepted_payment(InterceptTest::Forward);
 	do_test_intercepted_payment(InterceptTest::Fail);
+	// Make sure that a forward of an intercepted payment that fails downstream names the HTLC.
+	do_test_intercepted_payment(InterceptTest::FailDownstream);
 	// Make sure that intercepted payments will be automatically failed back if too many blocks pass.
 	do_test_intercepted_payment(InterceptTest::Timeout);
 }
@@ -2580,7 +2595,9 @@ fn do_test_intercepted_payment(test: InterceptTest) {
 		assert!(!nodes[1].node.is_intercepted_htlc_pending(intercept_id));
 		let fail =
 			HTLCHandlingFailureType::InvalidForward { requested_forward_scid: intercept_scid };
-		expect_htlc_failure_conditions(nodes[1].node.get_and_clear_pending_events(), &[fail]);
+		let events = nodes[1].node.get_and_clear_pending_events();
+		assert_names_failed_htlc(&events, intercept_id);
+		expect_htlc_failure_conditions(events, &[fail]);
 		nodes[1].node.process_pending_htlc_forwards();
 		let update_fail = get_htlc_update_msgs(&nodes[1], &node_a_id);
 		check_added_monitors(&nodes[1], 1);
@@ -2596,7 +2613,7 @@ fn do_test_intercepted_payment(test: InterceptTest) {
 			.blamed_chan_closed(true)
 			.expected_htlc_error_data(LocalHTLCFailureReason::UnknownNextPeer, &[]);
 		expect_payment_failed_conditions(&nodes[0], hash, false, fail_conditions);
-	} else if test == InterceptTest::Forward {
+	} else if test == InterceptTest::Forward || test == InterceptTest::FailDownstream {
 		// Check that we'll fail as expected when sending to a channel that isn't in `ChannelReady` yet.
 		let temp_id = nodes[1].node.create_channel(node_c_id, 100_000, 0, 42, None, None).unwrap();
 		let unusable_chan_err =
@@ -2643,6 +2660,39 @@ fn do_test_intercepted_payment(test: InterceptTest) {
 		);
 		expect_payment_claimable!(&nodes[2], hash, payment_secret, amt_msat, preimage, node_c_id);
 
+		if test == InterceptTest::FailDownstream {
+			nodes[2].node.fail_htlc_backwards(&hash);
+			let fail_type = HTLCHandlingFailureType::Receive { payment_hash: hash };
+			expect_and_process_pending_htlcs_and_htlc_handling_failed(&nodes[2], &[fail_type]);
+			check_added_monitors(&nodes[2], 1);
+			let update_fail = get_htlc_update_msgs(&nodes[2], &node_b_id);
+			nodes[1].node.handle_update_fail_htlc(node_c_id, &update_fail.update_fail_htlcs[0]);
+			let commitment = &update_fail.commitment_signed;
+			do_commitment_signed_dance(&nodes[1], &nodes[2], commitment, true, true);
+
+			let events = nodes[1].node.get_and_clear_pending_events();
+			assert_names_failed_htlc(&events, intercept_id);
+			let fail_type =
+				HTLCHandlingFailureType::Forward { node_id: Some(node_c_id), channel_id: chan_id };
+			expect_htlc_failure_conditions(events, &[fail_type]);
+			expect_and_process_pending_htlcs(&nodes[1], false);
+			check_added_monitors(&nodes[1], 1);
+
+			let update_fail = get_htlc_update_msgs(&nodes[1], &node_a_id);
+			nodes[0].node.handle_update_fail_htlc(node_b_id, &update_fail.update_fail_htlcs[0]);
+			let commitment = &update_fail.commitment_signed;
+			do_commitment_signed_dance(&nodes[0], &nodes[1], commitment, false, false);
+			let mut error_data = amt_msat.to_be_bytes().to_vec();
+			error_data
+				.extend_from_slice(&nodes[2].node.best_block.read().unwrap().height.to_be_bytes());
+			let fail_conditions = PaymentFailedConditions::new().expected_htlc_error_data(
+				LocalHTLCFailureReason::IncorrectPaymentDetails,
+				&error_data,
+			);
+			expect_payment_failed_conditions(&nodes[0], hash, true, fail_conditions);
+			return;
+		}
+
 		let path: &[&[_]] = &[&[&nodes[1], &nodes[2]]];
 		do_claim_payment_along_route(ClaimAlongRouteArgs::new(&nodes[0], path, preimage.unwrap()));
 
@@ -2674,7 +2724,10 @@ fn do_test_intercepted_payment(test: InterceptTest) {
 		}
 		let fail_type =
 			HTLCHandlingFailureType::InvalidForward { requested_forward_scid: intercept_scid };
-		expect_and_process_pending_htlcs_and_htlc_handling_failed(&nodes[1], &[fail_type]);
+		let events = nodes[1].node.get_and_clear_pending_events();
+		assert_names_failed_htlc(&events, intercept_id);
+		expect_htlc_failure_conditions(events, &[fail_type]);
+		expect_and_process_pending_htlcs(&nodes[1], false);
 		check_added_monitors(&nodes[1], 1);
 		assert!(!nodes[1].node.is_intercepted_htlc_pending(intercept_id));
 
