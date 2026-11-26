@@ -1,0 +1,12 @@
+# Bug Fixes
+
+ * A channel's `ChannelConfig::accept_underpaying_htlcs` is now persisted with the
+   `ChannelManager`. It read back as `false` after every restart, however it was set, so a node
+   that took underpaying HTLCs over a channel, such as an LSPS2 client taking a payment its LSP
+   skimmed a fee from, refused them on that channel once it restarted.
+
+# Backwards Compatibility
+
+ * A channel persisted by an earlier version reads back with `accept_underpaying_htlcs` off, as
+   before, until it is set again. An earlier version reading a channel written now drops the
+   setting.

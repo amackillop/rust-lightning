@@ -635,7 +635,7 @@ pub struct ChannelConfig {
 	///
 	/// # Note
 	/// Switching this config flag on may break compatibility with versions of LDK prior to 0.0.116.
-	/// Unsetting this flag between restarts may lead to payment receive failures.
+	/// Unsetting this flag on a channel may lead to payment receive failures.
 	///
 	/// Default value: `false`
 	///
@@ -830,6 +830,7 @@ impl crate::util::ser::Writeable for LegacyChannelConfig {
 			(5, self.options.max_dust_htlc_exposure, required),
 			(6, self.commit_upfront_shutdown_pubkey, required),
 			(8, self.options.forwarding_fee_base_msat, required),
+			(17, self.options.accept_underpaying_htlcs, (default_value, false)),
 		});
 		Ok(())
 	}
@@ -845,6 +846,7 @@ impl crate::util::ser::Readable for LegacyChannelConfig {
 		let mut commit_upfront_shutdown_pubkey = false;
 		let mut forwarding_fee_base_msat = 0;
 		let mut max_dust_htlc_exposure_enum = None;
+		let mut accept_underpaying_htlcs = false;
 		read_tlv_fields!(reader, {
 			(0, forwarding_fee_proportional_millionths, required),
 			// Has always been written, but became optionally read in 0.0.116
@@ -855,6 +857,7 @@ impl crate::util::ser::Readable for LegacyChannelConfig {
 			(5, max_dust_htlc_exposure_enum, option),
 			(6, commit_upfront_shutdown_pubkey, required),
 			(8, forwarding_fee_base_msat, required),
+			(17, accept_underpaying_htlcs, (default_value, false)),
 		});
 		let max_dust_htlc_exposure_msat_fixed_limit =
 			max_dust_htlc_exposure_msat_fixed_limit.unwrap_or(5_000_000);
@@ -868,7 +871,7 @@ impl crate::util::ser::Readable for LegacyChannelConfig {
 				cltv_expiry_delta,
 				force_close_avoidance_max_fee_satoshis,
 				forwarding_fee_base_msat,
-				accept_underpaying_htlcs: false,
+				accept_underpaying_htlcs,
 			},
 			announce_for_forwarding,
 			commit_upfront_shutdown_pubkey,

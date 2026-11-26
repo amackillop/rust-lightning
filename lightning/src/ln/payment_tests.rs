@@ -2759,14 +2759,23 @@ fn do_test_intercepted_payment(test: InterceptTest) {
 
 #[test]
 fn accept_underpaying_htlcs_config() {
-	do_accept_underpaying_htlcs_config(1);
-	do_accept_underpaying_htlcs_config(2);
-	do_accept_underpaying_htlcs_config(3);
+	do_accept_underpaying_htlcs_config(1, false);
+	do_accept_underpaying_htlcs_config(2, false);
+	do_accept_underpaying_htlcs_config(3, false);
 }
 
-fn do_accept_underpaying_htlcs_config(num_mpp_parts: usize) {
+#[test]
+fn accept_underpaying_htlcs_config_survives_reload() {
+	do_accept_underpaying_htlcs_config(1, true);
+	do_accept_underpaying_htlcs_config(2, true);
+}
+
+fn do_accept_underpaying_htlcs_config(num_mpp_parts: usize, reload_recipient: bool) {
 	let chanmon_cfgs = create_chanmon_cfgs(3);
 	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let persister;
+	let new_chain_monitor;
+	let node_c_reload;
 
 	let max_in_flight_percent = 10;
 	let mut intercept_forwards_config = test_default_channel_config();
@@ -2781,9 +2790,9 @@ fn do_accept_underpaying_htlcs_config(num_mpp_parts: usize) {
 		.channel_handshake_config
 		.unannounced_channel_max_inbound_htlc_value_in_flight_percentage = max_in_flight_percent;
 
-	let configs = [None, Some(intercept_forwards_config), Some(underpay_config)];
+	let configs = [None, Some(intercept_forwards_config), Some(underpay_config.clone())];
 	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &configs);
-	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+	let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
 
 	let node_a_id = nodes[0].node.get_our_node_id();
 	let node_b_id = nodes[1].node.get_our_node_id();
@@ -2799,6 +2808,30 @@ fn do_accept_underpaying_htlcs_config(num_mpp_parts: usize) {
 		let _ = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, channel_size, 0);
 		let chan = create_unannounced_chan_between_nodes_with_value(&nodes, 1, 2, channel_size, 0);
 		chan_ids.push(chan.0.channel_id);
+	}
+
+	if reload_recipient {
+		// Reload with the flag off by default, so only each channel's own setting accepts the
+		// underpaying HTLCs.
+		let mut config = underpay_config;
+		config.channel_config.accept_underpaying_htlcs = false;
+		let node_c_ser = nodes[2].node.encode();
+		let monitors: Vec<_> =
+			chan_ids.iter().map(|chan_id| get_monitor!(nodes[2], *chan_id).encode()).collect();
+		let monitors: Vec<&[u8]> = monitors.iter().map(|monitor| &monitor[..]).collect();
+		nodes[1].node.peer_disconnected(node_c_id);
+		reload_node!(
+			nodes[2],
+			config,
+			&node_c_ser,
+			&monitors,
+			persister,
+			new_chain_monitor,
+			node_c_reload
+		);
+		let mut reconnect_args = ReconnectArgs::new(&nodes[1], &nodes[2]);
+		reconnect_args.send_channel_ready = (true, true);
+		reconnect_nodes(reconnect_args);
 	}
 
 	// Send the initial payment.
