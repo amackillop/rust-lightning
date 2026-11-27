@@ -892,6 +892,19 @@ impl PeerState {
 			.any(|entry| entry.state.fee_payment_over(channel_id).is_some_and(<[_]>::is_empty))
 	}
 
+	/// Whether the channel was opened for a client-trusts-LSP buy whose funding transaction we have
+	/// not broadcast yet. A channel ready before [`LSPS2ServiceHandler::channel_ready`] ran for it
+	/// is found by its `user_channel_id`.
+	fn withholds_funding(&self, channel_id: &ChannelId, user_channel_id: u128) -> bool {
+		self.intercept_scid_by_channel_id
+			.get(channel_id)
+			.or_else(|| self.intercept_scid_by_user_channel_id.get(&user_channel_id))
+			.and_then(|intercept_scid| self.outbound_channels_by_intercept_scid.get(intercept_scid))
+			.is_some_and(|entry| {
+				entry.is_client_trusts_lsp() && !entry.should_broadcast_funding_transaction()
+			})
+	}
+
 	/// Returns the channel the buy with `intercept_scid` awaits a splice of, if any.
 	fn bound_channel(&self, intercept_scid: u64) -> Option<ChannelId> {
 		self.pending_splices_by_channel_id
@@ -1787,8 +1800,9 @@ where
 	/// uses the client-trusts-LSP model, as LDK broadcasts a splice transaction as soon as
 	/// `tx_signatures` are exchanged, if the buy is bound to another channel, if `channel_id` is
 	/// not a ready channel with the counterparty, if the channel awaits a splice for another buy, if
-	/// it carries a fee payment in flight from before its HTLCs were recorded, or if persisting the
-	/// binding fails, which leaves the buy unbound.
+	/// it has a splice in flight, if it was opened for a client-trusts-LSP buy whose funding
+	/// transaction is still withheld, if it carries a fee payment in flight from before its HTLCs
+	/// were recorded, or if persisting the binding fails, which leaves the buy unbound.
 	///
 	/// Calls for one buy must not overlap.
 	///
@@ -1797,20 +1811,20 @@ where
 	pub async fn splice_initiated(
 		&self, counterparty_node_id: &PublicKey, user_channel_id: u128, channel_id: &ChannelId,
 	) -> Result<(), APIError> {
-		let channel_is_ready = self
+		let channel = self
 			.channel_manager
 			.get_cm()
 			.list_channels_with_counterparty(counterparty_node_id)
-			.iter()
-			.any(|channel| channel.channel_id == *channel_id && channel.is_channel_ready);
-		if !channel_is_ready {
-			return Err(APIError::APIMisuseError {
+			.into_iter()
+			.find(|channel| channel.channel_id == *channel_id && channel.is_channel_ready)
+			.ok_or_else(|| APIError::APIMisuseError {
 				err: format!(
 					"Channel {} is not a ready channel with counterparty {}",
 					channel_id, counterparty_node_id
 				),
-			});
-		}
+			})?;
+		let splice_in_flight =
+			channel.splice_details.as_ref().is_some_and(|details| !details.candidates.is_empty());
 
 		let intercept_scid = {
 			let outer_state_lock = self.per_peer_state.read().unwrap();
@@ -1863,6 +1877,16 @@ where
 			if peer_state.pending_splices_by_channel_id.contains_key(channel_id) {
 				return Err(APIError::APIMisuseError {
 					err: format!("Channel {} awaits a splice for another buy", channel_id),
+				});
+			}
+			if splice_in_flight {
+				return Err(APIError::APIMisuseError {
+					err: format!("Channel {} has a splice in flight", channel_id),
+				});
+			}
+			if peer_state.withholds_funding(channel_id, channel.user_channel_id) {
+				return Err(APIError::APIMisuseError {
+					err: format!("Channel {}'s funding transaction is still withheld", channel_id),
 				});
 			}
 			if peer_state.carries_unrecorded_fee_payment(*channel_id) {
@@ -3716,6 +3740,55 @@ mod tests {
 		let ForwardPaymentAction(_, fee_payment) =
 			decoded_jit_channel.channel_ready(ChannelId([3; 32])).unwrap().unwrap();
 		assert_eq!(fee_payment.htlcs, vec![htlc]);
+	}
+
+	#[test]
+	fn withholds_funding_until_a_client_trusts_lsp_channel_may_be_broadcast() {
+		let opening_fee_params = LSPS2OpeningFeeParams {
+			min_fee_msat: 10_000_000,
+			proportional: 10_000,
+			valid_until: LSPSDateTime::from_str("2035-05-20T08:30:45Z").unwrap(),
+			min_lifetime: 4032,
+			max_client_to_self_delay: 2016,
+			min_payment_size_msat: 10_000_000,
+			max_payment_size_msat: 1_000_000_000,
+			promise: "ignore".to_string(),
+		};
+		let intercept_scid = 42;
+		let channel_id = ChannelId([44; 32]);
+		let buy = |client_trusts_lsp| {
+			let mut jit_channel =
+				OutboundJITChannel::new(None, opening_fee_params.clone(), 43, client_trusts_lsp);
+			jit_channel.state = OutboundJITChannelState::PaymentForwarded { channel_id };
+			let mut peer_state = PeerState::new();
+			peer_state.insert_outbound_channel(intercept_scid, jit_channel);
+			peer_state.intercept_scid_by_channel_id.insert(channel_id, intercept_scid);
+			peer_state
+		};
+
+		assert!(!buy(false).withholds_funding(&channel_id, 0));
+		assert!(!PeerState::new().withholds_funding(&channel_id, 43));
+
+		let mut peer_state = buy(true);
+		assert!(peer_state.withholds_funding(&channel_id, 0));
+		// Before the buy took the channel, its `user_channel_id` finds it.
+		let mut not_yet_taken = buy(true);
+		not_yet_taken.intercept_scid_by_channel_id.clear();
+		not_yet_taken.intercept_scid_by_user_channel_id.insert(43, intercept_scid);
+		assert!(not_yet_taken.withholds_funding(&channel_id, 43));
+		let jit_channel =
+			peer_state.outbound_channels_by_intercept_scid.get_mut(&intercept_scid).unwrap();
+		jit_channel.set_funding_tx(Transaction {
+			version: Version::TWO,
+			lock_time: LockTime::ZERO,
+			input: vec![],
+			output: vec![],
+		});
+		assert!(peer_state.withholds_funding(&channel_id, 0));
+		let jit_channel =
+			peer_state.outbound_channels_by_intercept_scid.get_mut(&intercept_scid).unwrap();
+		jit_channel.set_funding_tx_broadcast_safe(true);
+		assert!(!peer_state.withholds_funding(&channel_id, 0));
 	}
 
 	#[test]

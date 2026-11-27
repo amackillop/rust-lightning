@@ -5001,6 +5001,86 @@ fn splice_initiated_refuses_a_buy_under_the_client_trusts_lsp_model() {
 }
 
 #[test]
+fn splice_initiated_refuses_a_channel_with_a_splice_in_flight() {
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let mut service_node_config = test_default_channel_config();
+	service_node_config.htlc_interception_flags = HTLCInterceptionFlags::ToInterceptSCIDs as u8;
+	let node_chanmgrs =
+		create_node_chanmgrs(3, &node_cfgs, &[Some(service_node_config), None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+	let (lsps_nodes, promise_secret, channel_id, _) = setup_spliceable_lsps2_nodes(nodes);
+	let LSPSNodesWithPayer { ref service_node, ref client_node, .. } = lsps_nodes;
+	let client_node_id = client_node.inner.node.get_our_node_id();
+	let service_handler = service_node.liquidity_manager.lsps2_service_handler().unwrap();
+
+	buy_until_open_channel(&lsps_nodes, promise_secret, 7, "crossed");
+
+	// A splice no buy was bound to, e.g. the operator's.
+	provide_utxo_reserves(core::slice::from_ref(&service_node.inner), 1, Amount::ONE_BTC);
+	do_initiate_splice_in(
+		&service_node.inner,
+		&client_node.inner,
+		channel_id,
+		Amount::from_sat(50_000),
+	);
+
+	assert!(service_handler.splice_initiated(&client_node_id, 7, &channel_id).is_err());
+	assert_eq!(service_handler.buys_awaiting_channel(&client_node_id).len(), 1);
+	service_node.inner.node.get_and_clear_pending_msg_events();
+}
+
+#[test]
+fn splice_initiated_refuses_a_channel_whose_funding_is_withheld() {
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let mut service_node_config = test_default_channel_config();
+	service_node_config.htlc_interception_flags = HTLCInterceptionFlags::ToInterceptSCIDs as u8;
+	let node_chanmgrs =
+		create_node_chanmgrs(3, &node_cfgs, &[Some(service_node_config), None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+	let (lsps_nodes, promise_secret) = setup_test_lsps2_nodes_with_payer(nodes);
+	let LSPSNodesWithPayer { ref service_node, ref client_node, ref payer_node } = lsps_nodes;
+	let service_node_id = service_node.inner.node.get_our_node_id();
+	let client_node_id = client_node.inner.node.get_our_node_id();
+	let service_handler = service_node.liquidity_manager.lsps2_service_handler().unwrap();
+	create_chan_between_nodes_with_value(&payer_node, &service_node.inner, 2_000_000, 100_000);
+
+	let trusted_user_channel_id = 42;
+	buy_until_open_channel_with_trust_model(
+		&lsps_nodes,
+		promise_secret,
+		trusted_user_channel_id,
+		"trusted",
+		true,
+	);
+	let (channel_id, _) = create_channel_with_manual_broadcast(
+		&service_node_id,
+		&client_node_id,
+		&service_node,
+		&client_node,
+		trusted_user_channel_id,
+		&999_000,
+		true,
+	);
+	buy_until_open_channel(&lsps_nodes, promise_secret, 7, "second");
+
+	// Ready, but `channel_ready` has not run for the buy that opened it.
+	assert!(service_handler.splice_initiated(&client_node_id, 7, &channel_id).is_err());
+	// Taken by that buy, whose fee is not yet collected.
+	service_handler
+		.channel_ready(trusted_user_channel_id, &channel_id, &client_node_id, None)
+		.unwrap();
+	assert!(service_handler.splice_initiated(&client_node_id, 7, &channel_id).is_err());
+
+	for node in [&service_node.inner, &client_node.inner, payer_node] {
+		node.node.get_and_clear_pending_msg_events();
+		node.node.get_and_clear_pending_events();
+		node.chain_monitor.added_monitors.lock().unwrap().clear();
+	}
+}
+
+#[test]
 fn a_binding_that_fails_to_persist_is_dropped() {
 	let chanmon_cfgs = create_chanmon_cfgs(3);
 	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
