@@ -1786,8 +1786,11 @@ where
 	/// Returns an error if there is no buy for `user_channel_id` awaiting its channel, if the buy
 	/// uses the client-trusts-LSP model, as LDK broadcasts a splice transaction as soon as
 	/// `tx_signatures` are exchanged, if the buy is bound to another channel, if `channel_id` is
-	/// not a ready channel with the counterparty, if the channel awaits a splice for another buy, or
-	/// if it carries a fee payment in flight from before its HTLCs were recorded.
+	/// not a ready channel with the counterparty, if the channel awaits a splice for another buy, if
+	/// it carries a fee payment in flight from before its HTLCs were recorded, or if persisting the
+	/// binding fails, which leaves the buy unbound.
+	///
+	/// Calls for one buy must not overlap.
 	///
 	/// [`LSPS2ServiceEvent::OpenChannel`]: crate::lsps2::event::LSPS2ServiceEvent::OpenChannel
 	/// [`Event::ChannelReady`]: lightning::events::Event::ChannelReady
@@ -1809,7 +1812,7 @@ where
 			});
 		}
 
-		{
+		let intercept_scid = {
 			let outer_state_lock = self.per_peer_state.read().unwrap();
 			let inner_state_lock = outer_state_lock.get(counterparty_node_id).ok_or_else(|| {
 				APIError::APIMisuseError {
@@ -1875,14 +1878,24 @@ where
 				PendingSplice { intercept_scid, negotiated_funding_txos: Vec::new() },
 			);
 			peer_state.needs_persist |= true;
-		}
+			intercept_scid
+		};
 		self.peer_by_channel_id.write().unwrap().insert(*channel_id, *counterparty_node_id);
 
-		self.persist_peer_state(*counterparty_node_id).await.map_err(|e| {
-			APIError::APIMisuseError {
-				err: format!("Failed to persist peer state for {}: {}", counterparty_node_id, e),
+		if let Err(e) = self.persist_peer_state(*counterparty_node_id).await {
+			let unbound_channel_id =
+				self.per_peer_state.read().unwrap().get(counterparty_node_id).and_then(
+					|inner_state_lock| {
+						inner_state_lock.lock().unwrap().unbind_splice(intercept_scid)
+					},
+				);
+			if let Some(channel_id) = unbound_channel_id {
+				self.peer_by_channel_id.write().unwrap().remove(&channel_id);
 			}
-		})?;
+			return Err(APIError::APIMisuseError {
+				err: format!("Failed to persist peer state for {}: {}", counterparty_node_id, e),
+			});
+		}
 
 		Ok(())
 	}

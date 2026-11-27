@@ -4607,7 +4607,17 @@ fn buy_until_open_channel_with_trust_model(
 fn setup_spliceable_lsps2_nodes<'a, 'b, 'c>(
 	nodes: Vec<Node<'a, 'b, 'c>>,
 ) -> (LSPSNodesWithPayer<'a, 'b, 'c>, [u8; 32], ChannelId, u128) {
-	let (lsps_nodes, promise_secret) = setup_test_lsps2_nodes_with_payer(nodes);
+	setup_spliceable_lsps2_nodes_with_service_store(nodes, Arc::new(TestStore::new(false)))
+}
+
+fn setup_spliceable_lsps2_nodes_with_service_store<'a, 'b, 'c>(
+	nodes: Vec<Node<'a, 'b, 'c>>, service_kv_store: Arc<TestStore>,
+) -> (LSPSNodesWithPayer<'a, 'b, 'c>, [u8; 32], ChannelId, u128) {
+	let (lsps_nodes, promise_secret) = setup_test_lsps2_nodes_with_payer_and_kv_stores(
+		nodes,
+		service_kv_store,
+		Arc::new(TestStore::new(false)),
+	);
 	create_chan_between_nodes_with_value(
 		&lsps_nodes.payer_node,
 		&lsps_nodes.service_node.inner,
@@ -4988,6 +4998,35 @@ fn splice_initiated_refuses_a_buy_under_the_client_trusts_lsp_model() {
 
 	buy_until_open_channel_with_trust_model(&lsps_nodes, promise_secret, 7, "trusted", true);
 	assert!(service_handler.splice_initiated(&client_node_id, 7, &channel_id).is_err());
+}
+
+#[test]
+fn a_binding_that_fails_to_persist_is_dropped() {
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let mut service_node_config = test_default_channel_config();
+	service_node_config.htlc_interception_flags = HTLCInterceptionFlags::ToInterceptSCIDs as u8;
+	let node_chanmgrs =
+		create_node_chanmgrs(3, &node_cfgs, &[Some(service_node_config), None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+	let service_kv_store = Arc::new(TestStore::new(false));
+	let (lsps_nodes, promise_secret, channel_id, _) =
+		setup_spliceable_lsps2_nodes_with_service_store(nodes, Arc::clone(&service_kv_store));
+	let client_node_id = lsps_nodes.client_node.inner.node.get_our_node_id();
+	let service_handler =
+		lsps_nodes.service_node.liquidity_manager.lsps2_service_handler().unwrap();
+
+	buy_until_open_channel(&lsps_nodes, promise_secret, 7, "first");
+	buy_until_open_channel(&lsps_nodes, promise_secret, 8, "second");
+
+	service_kv_store.set_read_only(true);
+	assert!(service_handler.splice_initiated(&client_node_id, 7, &channel_id).is_err());
+	service_kv_store.set_read_only(false);
+
+	// Neither buy is kept from the channel by the binding that was never stored.
+	assert_eq!(service_handler.buys_awaiting_channel(&client_node_id).len(), 2);
+	service_handler.splice_initiated(&client_node_id, 7, &channel_id).unwrap();
+	assert!(service_handler.splice_initiated(&client_node_id, 8, &channel_id).is_err());
 }
 
 #[test]

@@ -1001,14 +1001,19 @@ impl Future for OneShotChannel {
 pub struct TestStore {
 	pending_async_writes: Mutex<HashMap<String, Vec<(usize, OneShotChannelState, Vec<u8>)>>>,
 	persisted_bytes: Mutex<HashMap<String, HashMap<String, Vec<u8>>>>,
-	read_only: bool,
+	read_only: AtomicBool,
 }
 
 impl TestStore {
 	pub fn new(read_only: bool) -> Self {
 		let pending_async_writes = Mutex::new(new_hash_map());
 		let persisted_bytes = Mutex::new(new_hash_map());
-		Self { pending_async_writes, persisted_bytes, read_only }
+		Self { pending_async_writes, persisted_bytes, read_only: AtomicBool::new(read_only) }
+	}
+
+	/// Makes every later [`KVStoreSync`] write and remove fail, or succeed again.
+	pub fn set_read_only(&self, read_only: bool) {
+		self.read_only.store(read_only, Ordering::Relaxed);
 	}
 
 	pub fn list_pending_async_writes(
@@ -1085,7 +1090,7 @@ impl TestStore {
 	fn remove_internal(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, _lazy: bool,
 	) -> io::Result<()> {
-		if self.read_only {
+		if self.read_only.load(Ordering::Relaxed) {
 			return Err(io::Error::new(
 				io::ErrorKind::PermissionDenied,
 				"Cannot modify read-only store",
@@ -1170,7 +1175,7 @@ impl KVStoreSync for TestStore {
 	fn write(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
 	) -> io::Result<()> {
-		if self.read_only {
+		if self.read_only.load(Ordering::Relaxed) {
 			return Err(io::Error::new(
 				io::ErrorKind::PermissionDenied,
 				"Cannot modify read-only store",
