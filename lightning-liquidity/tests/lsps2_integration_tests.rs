@@ -4716,6 +4716,9 @@ fn splice_into_existing_channel_forwards_once_locked() {
 	mine_transaction(&client_node.inner, &splice_tx);
 	lock_splice_after_blocks(&service_node.inner, &client_node.inner, ANTI_REORG_DELAY - 1);
 
+	// A splice that locked before its events were handled keeps its binding at startup.
+	assert!(service_handler.unbind_unstarted_splices().unwrap().is_empty());
+
 	// Until its funding is reported as negotiated for the buy, a splice that locked is not the
 	// buy's.
 	assert!(service_handler
@@ -5107,6 +5110,73 @@ fn a_binding_that_fails_to_persist_is_dropped() {
 	assert_eq!(service_handler.buys_awaiting_channel(&client_node_id).len(), 2);
 	service_handler.splice_initiated(&client_node_id, 7, &channel_id).unwrap();
 	assert!(service_handler.splice_initiated(&client_node_id, 8, &channel_id).is_err());
+}
+
+#[test]
+fn unbind_unstarted_splices_frees_only_splices_never_started() {
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let mut service_node_config = test_default_channel_config();
+	service_node_config.htlc_interception_flags = HTLCInterceptionFlags::ToInterceptSCIDs as u8;
+	let node_chanmgrs =
+		create_node_chanmgrs(3, &node_cfgs, &[Some(service_node_config), None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+	let (lsps_nodes, promise_secret, channel_id, _) = setup_spliceable_lsps2_nodes(nodes);
+	let LSPSNodesWithPayer { ref service_node, ref client_node, .. } = lsps_nodes;
+	let client_node_id = client_node.inner.node.get_our_node_id();
+	let service_handler = service_node.liquidity_manager.lsps2_service_handler().unwrap();
+
+	let (_, intercept_id) = buy_until_open_channel(&lsps_nodes, promise_secret, 7, "stale");
+
+	// Bound, but stopped before the splice was initiated.
+	service_handler.splice_initiated(&client_node_id, 7, &channel_id).unwrap();
+	assert!(service_handler.buys_awaiting_channel(&client_node_id).is_empty());
+	assert_eq!(
+		service_handler.unbind_unstarted_splices().unwrap(),
+		vec![(client_node_id, channel_id)]
+	);
+	assert_eq!(service_handler.buys_awaiting_channel(&client_node_id).len(), 1);
+
+	// A negotiated splice keeps its binding, as it may still lock.
+	service_handler.splice_initiated(&client_node_id, 7, &channel_id).unwrap();
+	let negotiated = OutPoint { txid: bitcoin::Txid::from_byte_array([1; 32]), index: 0 };
+	service_handler.splice_negotiated(&client_node_id, &channel_id, negotiated).unwrap();
+	assert!(service_handler.unbind_unstarted_splices().unwrap().is_empty());
+	assert!(service_handler.buys_awaiting_channel(&client_node_id).is_empty());
+
+	// The intercepted HTLC was held throughout.
+	service_node.inner.node.fail_intercepted_htlc(intercept_id).unwrap();
+	let events = service_node.inner.node.get_and_clear_pending_events();
+	assert!(matches!(events[..], [Event::HTLCHandlingFailed { .. }]));
+}
+
+#[test]
+fn unbind_unstarted_splices_keeps_a_splice_in_flight() {
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let mut service_node_config = test_default_channel_config();
+	service_node_config.htlc_interception_flags = HTLCInterceptionFlags::ToInterceptSCIDs as u8;
+	let node_chanmgrs =
+		create_node_chanmgrs(3, &node_cfgs, &[Some(service_node_config), None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+	let (lsps_nodes, promise_secret, channel_id, _) = setup_spliceable_lsps2_nodes(nodes);
+	let LSPSNodesWithPayer { ref service_node, ref client_node, .. } = lsps_nodes;
+	let client_node_id = client_node.inner.node.get_our_node_id();
+	let service_handler = service_node.liquidity_manager.lsps2_service_handler().unwrap();
+
+	buy_until_open_channel(&lsps_nodes, promise_secret, 7, "in flight");
+	service_handler.splice_initiated(&client_node_id, 7, &channel_id).unwrap();
+	provide_utxo_reserves(core::slice::from_ref(&service_node.inner), 1, Amount::ONE_BTC);
+	do_initiate_splice_in(
+		&service_node.inner,
+		&client_node.inner,
+		channel_id,
+		Amount::from_sat(50_000),
+	);
+
+	assert!(service_handler.unbind_unstarted_splices().unwrap().is_empty());
+	assert!(service_handler.buys_awaiting_channel(&client_node_id).is_empty());
+	service_node.inner.node.get_and_clear_pending_msg_events();
 }
 
 #[test]

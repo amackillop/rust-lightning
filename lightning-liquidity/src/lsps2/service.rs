@@ -741,10 +741,13 @@ struct PendingSplice {
 	/// The funding outputs of the splice transactions negotiated for the buy, its RBF attempts
 	/// included. The buy takes the channel once one of them locks.
 	negotiated_funding_txos: Vec<OutPoint>,
+	/// The channel's funding output when the buy was bound.
+	bound_funding_txo: Option<OutPoint>,
 }
 
 impl_writeable_tlv_based!(PendingSplice, {
 	(0, intercept_scid, required),
+	(1, bound_funding_txo, option),
 	(2, negotiated_funding_txos, required_vec),
 });
 
@@ -1899,7 +1902,11 @@ where
 			}
 			peer_state.pending_splices_by_channel_id.insert(
 				*channel_id,
-				PendingSplice { intercept_scid, negotiated_funding_txos: Vec::new() },
+				PendingSplice {
+					intercept_scid,
+					negotiated_funding_txos: Vec::new(),
+					bound_funding_txo: channel.funding_txo,
+				},
 			);
 			peer_state.needs_persist |= true;
 			intercept_scid
@@ -2013,6 +2020,76 @@ where
 		})?;
 
 		Ok(())
+	}
+
+	/// Unbinds every buy from a splice that was never started, leaving each awaiting its channel
+	/// with its HTLCs held, and returns the channels unbound with their counterparty.
+	///
+	/// Call this once at startup, before serving any buy. A buy is unbound when no splice was
+	/// reported for it through [`Self::splice_negotiated`], its channel has no splice in flight that
+	/// we contribute to, and the channel's funding output is the one it had when the buy was bound.
+	/// A channel that is gone is left to [`Self::channel_closed`].
+	///
+	/// Every peer is examined even if persisting one fails, and what was unbound in memory stays so
+	/// and is persisted later. The error names the first peer that failed.
+	pub async fn unbind_unstarted_splices(&self) -> Result<Vec<(PublicKey, ChannelId)>, APIError> {
+		let peers: Vec<PublicKey> = self.per_peer_state.read().unwrap().keys().copied().collect();
+		let mut unbound = Vec::new();
+		let mut first_error = None;
+		for counterparty_node_id in peers {
+			let idle_funding_txos: HashMap<ChannelId, Option<OutPoint>> = self
+				.channel_manager
+				.get_cm()
+				.list_channels_with_counterparty(&counterparty_node_id)
+				.into_iter()
+				.filter(|channel| {
+					channel.splice_details.as_ref().map_or(true, |details| {
+						details.candidates.iter().all(|candidate| candidate.contribution.is_none())
+					})
+				})
+				.map(|channel| (channel.channel_id, channel.funding_txo))
+				.collect();
+			let freed_channels = {
+				let outer_state_lock = self.per_peer_state.read().unwrap();
+				let Some(inner_state_lock) = outer_state_lock.get(&counterparty_node_id) else {
+					continue;
+				};
+				let mut peer_state = inner_state_lock.lock().unwrap();
+				let stale: Vec<(ChannelId, u64)> = peer_state
+					.pending_splices_by_channel_id
+					.iter()
+					.filter(|(channel_id, splice)| {
+						splice.negotiated_funding_txos.is_empty()
+							&& idle_funding_txos
+								.get(*channel_id)
+								.is_some_and(|funding_txo| *funding_txo == splice.bound_funding_txo)
+					})
+					.map(|(channel_id, splice)| (*channel_id, splice.intercept_scid))
+					.collect();
+				unbound.extend(
+					stale.iter().map(|(channel_id, _)| (counterparty_node_id, *channel_id)),
+				);
+				stale
+					.into_iter()
+					.filter_map(|(_, intercept_scid)| peer_state.unbind_splice(intercept_scid))
+					.collect::<Vec<_>>()
+			};
+			{
+				let mut peer_by_channel_id = self.peer_by_channel_id.write().unwrap();
+				for channel_id in freed_channels {
+					peer_by_channel_id.remove(&channel_id);
+				}
+			}
+			if let Err(e) = self.persist_peer_state(counterparty_node_id).await {
+				first_error.get_or_insert(APIError::APIMisuseError {
+					err: format!(
+						"Failed to persist peer state for {}: {}",
+						counterparty_node_id, e
+					),
+				});
+			}
+		}
+		first_error.map_or(Ok(unbound), Err)
 	}
 
 	/// Records a splice transaction negotiated for a buy bound through [`Self::splice_initiated`].
@@ -3197,6 +3274,23 @@ where
 		}
 	}
 
+	/// Unbinds every buy from a splice that was never started.
+	///
+	/// Wraps [`LSPS2ServiceHandler::unbind_unstarted_splices`].
+	pub fn unbind_unstarted_splices(&self) -> Result<Vec<(PublicKey, ChannelId)>, APIError> {
+		let mut fut = pin!(self.inner.unbind_unstarted_splices());
+
+		let mut waker = dummy_waker();
+		let mut ctx = task::Context::from_waker(&mut waker);
+		match fut.as_mut().poll(&mut ctx) {
+			task::Poll::Ready(result) => result,
+			task::Poll::Pending => {
+				// In a sync context, we can't wait for the future to complete.
+				unreachable!("Should not be pending in a sync context");
+			},
+		}
+	}
+
 	/// Records a splice transaction negotiated for a buy bound through
 	/// [`LSPS2ServiceHandler::splice_initiated`].
 	///
@@ -3902,6 +3996,7 @@ mod tests {
 			PendingSplice {
 				intercept_scid: spliced_intercept_scid,
 				negotiated_funding_txos: vec![OutPoint { txid: Txid::all_zeros(), index: 0 }],
+				bound_funding_txo: None,
 			},
 		);
 		peer_state.needs_persist = false;
